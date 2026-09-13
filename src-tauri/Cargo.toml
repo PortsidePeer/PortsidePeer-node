@@ -1,0 +1,40 @@
+[package]
+name = "portsidepeer"
+version = "0.1.2"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "portsidepeer_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2.0", features = [] }
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.0", features = ["full"] }
+futures = "0.3"
+
+# libp2p configuration:
+libp2p = { version = "0.54", features = ["tokio", "mdns", "kad", "noise", "yamux", "tcp", "dns", "relay", "identify", "dcutr", "request-response", "cbor", "macros"] }
+libp2p-swarm = "0.45"
+
+tauri-plugin-opener = "2.0"
+tauri-plugin-dialog = "2"
+serde_json = "1.0.151"
+rand = "0.8"
+rusqlite = { version = "0.31", features = ["bundled"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+
+# log crates
+log = "0.4"
+env_logger = "0.11"
