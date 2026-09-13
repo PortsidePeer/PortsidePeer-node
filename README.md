@@ -1,6 +1,6 @@
 # PortsidePeer
 
-Decentralized peer to peer chat app built for the user and not for data centers. It was built for local first in mind, you can use it on your local network without being connected to the www. To use it over the www all you need is a relay!
+Decentralized peer to peer chat app built for the user and not for data centers. It was built with local first in mind, you can use it on your local network without being connected to the www. To use it over the www all you need is a relay!
 
 ### Features (so far)
 
@@ -12,10 +12,16 @@ Decentralized peer to peer chat app built for the user and not for data centers.
 - Send Files to everyone in the chatroom.
 - Message history stored locally.
 
-### Building from source
+### Running from source
 
 After installing the prerequisites for Tauri clone the repo and run `npm run tauri dev`.
 
+### Building from source
+
+`npm run tauri build`
+
+For some reason no Arch based distros this is needed.
+
+`NO_STRIP=true npm run tauri build`
+
 ### Releases (soon)
-
-
