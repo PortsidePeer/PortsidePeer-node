@@ -1,6 +1,6 @@
 # PortsidePeer
 
-Decentralized peer to peer chat app built for the user and not for data centers. It was built with local first in mind, you can use it on your local network without being connected to the www. To use it over the www all you need is a relay!
+Decentralized peer to peer chat app built for the user and not for data centers. It was built with local first in mind, you can use it on your local network without being connected to the world wide web. To use it over the www all you need is a relay!
 
 ### Features (so far)
 
