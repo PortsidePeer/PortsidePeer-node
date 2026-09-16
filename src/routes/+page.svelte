@@ -54,6 +54,104 @@
 
   const NEAR_BOTTOM_PX = 200;
 
+  // Channels
+  let channels = $state([]);
+  let activeChannel = $state('sbb-lounge');
+  let channelNameInput = $state('');
+  let editingChannel = $state(false);
+  let showNewChannel = $state(false);
+  let newChannelInput = $state('');
+
+  const CHANNEL_MARKER = 'P2P_CHANNEL:';
+
+  function slugify(name) {
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+    return slug || 'channel';
+  }
+
+  function channelOf(msg) {
+    return typeof msg?.channel === 'string' && msg.channel ? msg.channel : 'sbb-lounge';
+  }
+
+  function activeChannelName() {
+    return channels.find((c) => c.id === activeChannel)?.name ?? activeChannel;
+  }
+
+  function channelEventPayloadOf(msg) {
+    const body = displayBody(msg);
+    if (typeof body !== 'string' || !body.startsWith(CHANNEL_MARKER)) return null;
+    try {
+      const payload = JSON.parse(body.slice(CHANNEL_MARKER.length));
+      if (typeof payload?.id === 'string' && typeof payload?.name === 'string' && (payload.a === 'create' || payload.a === 'rename')) return payload;
+    } catch { /* ignore */ }
+    return null;
+  }
+
+  async function applyChannelEvent(msg) {
+    const payload = channelEventPayloadOf(msg);
+    if (!payload) return;
+    if (payload.a === 'create' && !channels.some((c) => c.id === payload.id)) {
+      try {
+        const info = await invoke('create_channel', { id: payload.id, name: payload.name });
+        channels = [...channels, info];
+      } catch {
+        channels = [...channels.filter((c) => c.id !== payload.id), { id: payload.id, name: payload.name }];
+      }
+    } else if (payload.a === 'rename') {
+      try {
+        await invoke('rename_channel', { id: payload.id, name: payload.name });
+        channels = channels.map((c) => (c.id === payload.id ? { ...c, name: payload.name } : c));
+      } catch (err) {
+        console.error('[accord] channel rename failed', err);
+      }
+    }
+  }
+
+  async function createChannel(e) {
+    e.preventDefault();
+    const name = newChannelInput.trim();
+    if (!name) return;
+    let id = slugify(name);
+    if (channels.some((c) => c.id === id)) id = `${id}-${Math.random().toString(36).slice(2, 6)}`;
+    try {
+      const info = await invoke('create_channel', { id, name });
+      channels = [...channels, info];
+      await invoke('send_chat_message', {
+        message: `${CHANNEL_MARKER}${JSON.stringify({ a: 'create', id, name })}`,
+        uid: crypto.randomUUID(),
+        channel: activeChannel
+      });
+      activeChannel = id;
+      showNewChannel = false;
+      newChannelInput = '';
+    } catch (err) {
+      alert(err);
+    }
+  }
+
+  async function renameChannel(e) {
+    e.preventDefault();
+    const name = channelNameInput.trim();
+    if (!name) return;
+    const id = activeChannel;
+    try {
+      await invoke('rename_channel', { id, name });
+      channels = channels.map((c) => (c.id === id ? { ...c, name } : c));
+      await invoke('send_chat_message', {
+        message: `${CHANNEL_MARKER}${JSON.stringify({ a: 'rename', id, name })}`,
+        uid: crypto.randomUUID(),
+        channel: id
+      });
+      editingChannel = false;
+    } catch (err) {
+      alert(err);
+    }
+  }
+
+  const visibleMessages = $derived.by(() =>
+    messages.filter((m) => channelOf(m) === activeChannel)
+  );
+
   function isNearBottom() {
     if (!messageLogEl) return true;
     return (
@@ -100,6 +198,11 @@
     observer.observe(inner);
     return () => observer.disconnect();
   });
+
+$effect(() => {
+   activeChannel;
+   scrollToBottom('auto');
+ });
 
   function escapeRegExp(str) {
     return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -739,6 +842,10 @@
       const list = await safe('get_allow_list', () => invoke('get_allow_list'));
       allowedPeers = Array.isArray(list) ? list : [];
 
+      const chans = await safe('get_channels', () => invoke('get_channels'));
+      channels = Array.isArray(chans) && chans.length ? chans : [{ id: 'sbb-lounge', name: 'sbb-lounge' }];
+      activeChannel = channels[0].id;
+
       const historicalLogs = await safe('get_chat_history', () => invoke('get_chat_history'));
       const allLogs = Array.isArray(historicalLogs) ? historicalLogs : [];
 
@@ -746,11 +853,9 @@
       const chatOnly = [];
       for (const m of allLogs) {
         if (!m || typeof m !== 'object') continue;
-        if (reactionPayloadOf(m)) {
-          applyReactionEvent(m);
-        } else {
-          chatOnly.push(m);
-        }
+        if (reactionPayloadOf(m)) { applyReactionEvent(m); continue; }
+        if (channelEventPayloadOf(m)) { applyChannelEvent(m); continue; }
+        chatOnly.push(m);
       }
       messages = chatOnly;
 
@@ -801,6 +906,7 @@
         if (incoming && typeof incoming === 'object') {
           if (incoming.uid && messages.some((m) => m.uid === incoming.uid)) return;
           if (reactionPayloadOf(incoming)) { applyReactionEvent(incoming); return; }
+          if (channelEventPayloadOf(incoming)) { applyChannelEvent(incoming); return; }
           messages = [...messages, incoming];
         }
       });
@@ -824,8 +930,8 @@
     e.preventDefault();
     if (!inputMessage.trim()) return;
     const uid = crypto.randomUUID();
-    messages = [...messages, { uid, sender: userNickname, channel: 'sbb-lounge', body: inputMessage }];
-    await invoke('send_chat_message', { message: inputMessage, uid });
+    messages = [...messages, { uid, channel: activeChannel, sender: userNickname, body: inputMessage }];
+    await invoke('send_chat_message', { message: inputMessage, uid, channel: activeChannel });
     inputMessage = '';
     showEmojiPicker = false;
   }
@@ -918,6 +1024,31 @@
       </div>
 
       <div class="panel-section">
+        <h4>Channels ({channels.length})</h4>
+        <div class="channel-list">
+          {#each channels as channel (channel.id)}
+            <button
+              type="button"
+              class="channel-row"
+              class:active={channel.id === activeChannel}
+              onclick={() => (activeChannel = channel.id)}
+            >
+              <span class="hash-tag">#</span>
+              <span class="channel-name">{channel.name}</span>
+            </button>
+          {/each}
+        </div>
+        {#if showNewChannel}
+          <form onsubmit={createChannel} class="sidebar-form" style="margin-top: 8px;">
+            <input bind:value={newChannelInput} placeholder="Add new channel!" autocomplete="off" />
+            <button type="submit">Create</button>
+          </form>
+        {:else}
+          <button type="button" class="add-channel-btn" onclick={() => (showNewChannel = true)}>+ Add Channel</button>
+        {/if}
+      </div>
+
+      <div class="panel-section">
         <h4>GIF Search</h4>
         {#if klipySaved}
           <div class="relay-status-box active">
@@ -991,7 +1122,23 @@
   <section class="main-workspace">
     <header class="app-header">
       <div class="server-info">
-        <h3><span class="hash-tag">#</span> sbb-lounge</h3>
+          {#if editingChannel}
+            <form onsubmit={renameChannel} class="channel-rename-form">
+              <input bind:value={channelNameInput} class="edit-input" />
+              <button type="submit" class="save-btn">✓</button>
+              <button type="button" onclick={() => (editingChannel = false)} class="cancel-btn">✕</button>
+            </form>
+          {:else}
+            <button
+              type="button"
+              class="channel-title-btn"
+              onclick={() => { channelNameInput = activeChannelName(); editingChannel = true; }}
+            >
+              <span class="hash-tag">#</span>
+              <span class="channel-title-text">{activeChannelName()}</span>
+              <span class="rename-hint" aria-hidden="true">✏️</span>
+            </button>
+          {/if}
         <span class="status-indicator">Private Mesh Active</span>
       </div>
     </header>
@@ -1005,7 +1152,7 @@
               <p>The file-broker link is running. Use the GIF launcher tab to share expressions.</p>
             </div>
           {/if}
-          {#each messages as msg}
+          {#each visibleMessages as msg}
             {@const body = displayBody(msg)}
             {@const gifUrl = extractGifUrl(body)}
             {@const fileInfo = extractFileInfo(body)}
@@ -2209,5 +2356,79 @@
   .file-open-btn:hover { background: #059669; }
 
   .file-progress-label { color: #10b981; font-size: 11px; font-weight: 700; flex-shrink: 0; }
+
+  .channel-list { display: flex; flex-direction: column; gap: 2px; }
+
+  .channel-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: transparent;
+    border: none;
+    color: #94a3b8;
+    padding: 6px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+    text-align: left;
+    transition: background-color 0.15s ease, color 0.15s ease;
+  }
+
+  .channel-row:hover { background: #1f232b; color: #e2e8f0; }
+  .channel-row.active { background: #1f232b; color: #10b981; font-weight: 600; }
+
+  .channel-row .hash-tag { font-size: 14px; }
+  .channel-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .add-channel-btn {
+    width: 100%;
+    margin-top: 6px;
+    background: transparent;
+    border: 1px dashed #1f232b;
+    color: #475569;
+    padding: 6px;
+    border-radius: 4px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: border-color 0.15s ease, color 0.15s ease;
+  }
+  .add-channel-btn:hover { border-color: #10b981; color: #10b981; }
+
+  .channel-rename-form { display: flex; gap: 6px; align-items: center; }
+
+  .rename-hint { opacity: 0; font-size: 11px; transition: opacity 0.15s ease; }
+  .channel-title-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin: 0;
+    padding: 2px 6px;
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 15px;
+    font-weight: 600;
+    color: #e2e8f0;
+    text-align: left;
+  }
+
+  .channel-title-btn:hover { background: #1f232b; }
+
+  .channel-title-text {
+    font-size: 15px;
+    font-weight: 600;
+  }
+
+  .rename-hint {
+    opacity: 0;
+    font-size: 11px;
+    transition: opacity 0.15s ease;
+  }
+
+  .channel-title-btn:hover .rename-hint,
+  .channel-title-btn:focus-visible .rename-hint {
+    opacity: 1;
+  }
 
   </style>

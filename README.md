@@ -28,7 +28,7 @@ After installing the prerequisites for Tauri clone the repo and run `npm run tau
 
 `npm run tauri build`
 
-For some reason no Arch based distros this is needed.
+For some reason for Arch based distros this is needed.
 
 `NO_STRIP=true npm run tauri build`
 

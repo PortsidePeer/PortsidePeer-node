@@ -46,8 +46,59 @@ pub struct ChatBehavior {
 pub struct WireMessage {
     pub uid: Option<String>,
     pub timestamp: Option<String>,
+    pub channel: Option<String>,
     pub sender: String,
     pub body: String,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct ChannelInfo {
+    pub id: String,
+    pub name: String,
+}
+
+pub fn get_saved_channels(app_handle: &tauri::AppHandle) -> Vec<ChannelInfo> {
+    let mut config_dir = app_handle
+        .path()
+        .app_config_dir()
+        .unwrap_or_else(|_| PathBuf::from("."));
+    if let Ok(profile_suffix) = std::env::var("APP_PROFILE") {
+        config_dir.push(profile_suffix);
+    }
+    let mut path = config_dir;
+    path.push("channels.json");
+
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| {
+            vec![ChannelInfo {
+                id: "sbb-lounge".to_string(),
+                name: "sbb-lounge".to_string(),
+            }]
+        })
+}
+
+fn persist_channels(app_handle: &tauri::AppHandle, list: &[ChannelInfo]) -> Result<(), String> {
+    let mut config_dir = app_handle
+        .path()
+        .app_config_dir()
+        .unwrap_or_else(|_| PathBuf::from("."));
+    if let Ok(suffix) = std::env::var("APP_PROFILE") {
+        config_dir.push(suffix);
+    }
+    config_dir.push("channels.json");
+    fs::write(&config_dir, serde_json::to_string(list).unwrap()).map_err(|e| e.to_string())
+}
+
+fn valid_channel_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !id.starts_with('-')
+        && !id.ends_with('-')
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -102,12 +153,14 @@ pub struct AppState {
     pub relay_endpoint: Arc<Mutex<Option<RelayEndpoint>>>,
     pub relay_status: Arc<Mutex<RelayStatus>>,
     pub klipy_config: Arc<Mutex<Option<KlipyConfig>>>,
+    pub channels: Arc<Mutex<Vec<ChannelInfo>>>,
 }
 
 #[derive(Debug, Clone)]
 pub enum OutboundCommand {
     Chat {
         uid: String,
+        channel: String,
         body: String,
     },
     FileTransfer {
@@ -141,8 +194,8 @@ pub fn get_or_create_identity(
     allow_list_path.push("allow_list.json");
 
     let keypair = if key_path.exists() {
-        let mut bytes = fs::read(&key_path).unwrap();
-        libp2p::identity::Keypair::from_protobuf_encoding(&mut bytes).unwrap_or_else(|_| {
+        let bytes = fs::read(&key_path).unwrap();
+        libp2p::identity::Keypair::from_protobuf_encoding(&bytes).unwrap_or_else(|_| {
             let new_key = libp2p::identity::Keypair::generate_ed25519();
             let _ = fs::write(&key_path, new_key.to_protobuf_encoding().unwrap());
             new_key
@@ -303,12 +356,7 @@ fn get_chat_history(state: tauri::State<'_, AppState>) -> Result<Vec<ChatMessage
         })
         .map_err(|e| e.to_string())?;
 
-    let mut history = Vec::new();
-    for row in rows {
-        if let Ok(msg) = row {
-            history.push(msg);
-        }
-    }
+    let history: Vec<_> = rows.flatten().collect();
     Ok(history)
 }
 
@@ -407,12 +455,18 @@ fn remove_from_allow_list(
 fn send_chat_message(
     message: String,
     uid: Option<String>,
+    channel: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     let uid = uid.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let channel = channel.unwrap_or_else(|| "sbb-lounge".to_string());
     state
         .tx
-        .send(OutboundCommand::Chat { uid, body: message })
+        .send(OutboundCommand::Chat {
+            uid,
+            channel,
+            body: message,
+        })
         .map_err(|e| e.to_string())
 }
 
@@ -592,6 +646,7 @@ const CHUNK_SIZE: usize = 256 * 1024;
 fn send_file(
     path: String,
     uid: String,
+    channel: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     let file_path = std::path::Path::new(&path);
@@ -613,6 +668,7 @@ fn send_file(
         .tx
         .send(OutboundCommand::Chat {
             uid: uid.clone(),
+            channel: channel.clone(),
             body: format!("P2P_MEDIA_FILE:{}", info),
         })
         .map_err(|e| e.to_string())?;
@@ -712,6 +768,53 @@ fn open_local_file(path: String, _state: tauri::State<'_, AppState>) -> Result<(
     tauri_plugin_opener::open_path(p, None::<&str>).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn get_channels(state: tauri::State<'_, AppState>) -> Vec<ChannelInfo> {
+    state.channels.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn create_channel(
+    id: String,
+    name: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<ChannelInfo, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() || name.len() > 64 {
+        return Err("Channel name must be 1–64 characters".to_string());
+    }
+    if !valid_channel_id(&id) {
+        return Err("Invalid channel id".to_string());
+    }
+    let mut list = state.channels.lock().unwrap();
+    if list.iter().any(|c| c.id == id) {
+        return Err("Channel already exists".to_string());
+    }
+    let info = ChannelInfo { id, name };
+    list.push(info.clone());
+    persist_channels(&state.app_handle, &list)?;
+    Ok(info)
+}
+
+#[tauri::command]
+fn rename_channel(
+    id: String,
+    name: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let name = name.trim().to_string();
+    if name.is_empty() || name.len() > 64 {
+        return Err("Channel name must be 1–64 characters".to_string());
+    }
+    let mut list = state.channels.lock().unwrap();
+    let channel = list
+        .iter_mut()
+        .find(|c| c.id == id)
+        .ok_or_else(|| "Channel not found".to_string())?;
+    channel.name = name;
+    persist_channels(&state.app_handle, &list)
+}
+
 pub fn start_p2p_backend(
     app_handle: tauri::AppHandle,
     keypair: libp2p::identity::Keypair,
@@ -767,11 +870,14 @@ pub fn start_p2p_backend(
             }
 
             let store = kad::store::MemoryStore::new(local_peer_id);
-            let mut mdns_config = mdns::Config::default();
-            mdns_config.enable_ipv6 = false;
+
+            let mdns_config = mdns::Config {
+                enable_ipv6: false,
+                ..Default::default()
+            };
 
             let identify_config = identify::Config::new(
-                "/accord/1.0.0".to_string(),
+                "/portsidepeer/1.0.0".to_string(),
                 keypair.public(),
             );
 
@@ -780,20 +886,20 @@ pub fn start_p2p_backend(
 
             let req_res_behaviour = request_response::cbor::Behaviour::new(
                 [(
-                    libp2p::StreamProtocol::new("/accord-chat/1.0.0"),
+                    libp2p::StreamProtocol::new("/portsidepeer-chat/1.0.0"),
                     request_response::ProtocolSupport::Full,
                 )],
                 req_res_config,
             );
 
             let file_behaviour = request_response::cbor::Behaviour::new(
-                [(libp2p::StreamProtocol::new("/accord-file/1.0.0"), request_response::ProtocolSupport::Full)],
+                [(libp2p::StreamProtocol::new("/portsidepeer-file/1.0.0"), request_response::ProtocolSupport::Full)],
                 request_response::Config::default()
                     .with_request_timeout(std::time::Duration::from_secs(60)),
             );
 
             // Dedicated StreamProtocol for the Kademlia ledger
-            let kad_protocol = libp2p::StreamProtocol::new("/accord-kad/1.0.0");
+            let kad_protocol = libp2p::StreamProtocol::new("/portsidepeer-kad/1.0.0");
             let kad_config = kad::Config::new(kad_protocol);
             let mut kademlia = kad::Behaviour::with_config(local_peer_id, store, kad_config);
             kademlia.set_mode(Some(kad::Mode::Server));
@@ -993,7 +1099,7 @@ pub fn start_p2p_backend(
                                 OutboundCommand::FileTransfer { id, name, size, data } => {
                                     if let Some(app_state) = app_handle_clone.try_state::<AppState>() {
                                         let allow = app_state.allow_list.lock().unwrap().clone();
-                                        let total = ((data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
+                                        let total = data.len().div_ceil(CHUNK_SIZE) as u32;
                                         for friend in &allow {
                                             if let Ok(peer) = PeerId::from_str(friend) {
                                                 for (seq, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
@@ -1011,7 +1117,7 @@ pub fn start_p2p_backend(
                                         log::info!("📦 Queued file '{}' ({} bytes, {} chunks/peer, {} peers)", name, size, total, allow.len());
                                     }
                                 }
-                                OutboundCommand::Chat { uid, body } => {
+                                OutboundCommand::Chat { uid, channel, body } => {
                                     if let Some(app_state) = app_handle_clone.try_state::<AppState>() {
                                         let current_allow_list = app_state.allow_list.lock().unwrap().clone();
                                         let nickname = profile_clone.lock().unwrap().nickname.clone();
@@ -1058,6 +1164,7 @@ pub fn start_p2p_backend(
                                                     WireMessage {
                                                         uid: Some(uid.clone()),
                                                         timestamp: Some(now.clone()),
+                                                        channel: Some(channel.clone()),
                                                         sender: nickname.clone(),
                                                         body: body.clone(),
                                                     },
@@ -1177,6 +1284,7 @@ pub fn start_p2p_backend(
                                             let timestamp = request.timestamp.clone().unwrap_or_else(|| {
                                                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
                                             });
+                                            let chat_channel = request.channel.clone().unwrap_or_else(|| "sbb-lounge".to_string());
                                             if let Some(app_state) = app_handle_clone.try_state::<AppState>() {
                                                 if let Ok(db) = app_state.db.lock() {
                                                     let _ = db.execute(
@@ -1184,7 +1292,7 @@ pub fn start_p2p_backend(
                                                         rusqlite::params![
                                                             request.uid.as_deref(),
                                                             request.sender.as_str(),
-                                                            "sbb-lounge",
+                                                            chat_channel.as_str(),
                                                             request.body.as_str(),
                                                             timestamp.as_str()
                                                         ],
@@ -1196,7 +1304,7 @@ pub fn start_p2p_backend(
                                                 id: None,
                                                 uid: request.uid,
                                                 sender: request.sender,
-                                                channel: "sbb-lounge".to_string(),
+                                                channel: chat_channel,
                                                 body: request.body,
                                                 timestamp,
                                             });
@@ -1227,7 +1335,7 @@ pub fn start_p2p_backend(
                                                     let offset = (request.seq as usize) * CHUNK_SIZE;
                                                     let part = files_dir.join(format!("{}.part", request.transfer_id));
                                                     let mut ok = false;
-                                                    if let Ok(mut f) = fs::OpenOptions::new().create(true).write(true).open(&part) {
+                                                    if let Ok(mut f) = fs::OpenOptions::new().truncate(true).write(true).open(&part) {
                                                         use std::io::{Seek, SeekFrom, Write};
                                                         if f.seek(SeekFrom::Start(offset as u64)).is_ok() && f.write_all(&request.data).is_ok() {
                                                             ok = true;
@@ -1383,6 +1491,9 @@ pub fn run() {
             let klipy_config = get_saved_klipy_config(&app_handle);
             let shared_klipy = Arc::new(Mutex::new(klipy_config));
 
+            let channels = get_saved_channels(&app_handle);
+            let shared_channels = Arc::new(Mutex::new(channels));
+
             app.manage(AppState {
                 tx: network_tx,
                 profile: shared_profile,
@@ -1392,6 +1503,7 @@ pub fn run() {
                 relay_endpoint: shared_relay_endpoint,
                 relay_status: shared_relay_status,
                 klipy_config: shared_klipy,
+                channels: shared_channels,
             });
             Ok(())
         })
@@ -1415,6 +1527,9 @@ pub fn run() {
             save_klipy_key,
             get_klipy_key,
             clear_klipy_key,
+            get_channels,
+            create_channel,
+            rename_channel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
