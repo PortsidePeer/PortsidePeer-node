@@ -64,6 +64,59 @@
 
   const CHANNEL_MARKER = 'P2P_CHANNEL:';
 
+  let replyTo = $state(null);
+
+  const REPLY_MARKER = 'P2P_REPLY:';
+
+  function replyPreviewOf(msg) {
+    const body = displayBody(msg);
+    return extractGifUrl(body) ? 'a GIF' : extractFileInfo(body) ? 'a file' : body.slice(0, 80);
+  }
+
+  function startReply(msg) {
+    replyTo = {
+      key: messageKey(msg),
+      name: senderName(msg),
+      preview: replyPreviewOf(msg)
+    };
+    showEmojiPicker = false;
+    composerInputEl?.focus();
+  }
+
+  function cancelReply() {
+    replyTo = null;
+  }
+
+  function messageByKey(key) {
+    if (typeof key !== 'string') return null;
+    if (key.startsWith('uid:')) {
+      const uid = key.slice(4);
+      return messages.find((m) => m.uid === uid) ?? null;
+    }
+    if (key.startsWith('legacy:')) {
+      const raw = key.slice(7);
+      const idx = raw.lastIndexOf('::');
+      if (idx === -1) return null;
+      return (
+        messages.find(
+          (m) => !m.uid && senderName(m) === raw.slice(0, idx) && displayBody(m) === raw.slice(idx + 2)
+        ) ?? null
+      );
+    }
+    return null;
+  }
+
+  function replyParentOf(body) {
+    if (typeof body !== 'string' || !body.startsWith(REPLY_MARKER)) return null;
+    const newline = body.indexOf('\n');
+    const jsonPart = newline === -1 ? body.slice(REPLY_MARKER.length) : body.slice(REPLY_MARKER.length, newline);
+    try {
+      const payload = JSON.parse(jsonPart);
+      if (typeof payload?.t === 'string') return payload.t;
+    } catch { }
+    return null;
+  }
+
   function slugify(name) {
     const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
     return slug || 'channel';
@@ -83,7 +136,7 @@
     try {
       const payload = JSON.parse(body.slice(CHANNEL_MARKER.length));
       if (typeof payload?.id === 'string' && typeof payload?.name === 'string' && (payload.a === 'create' || payload.a === 'rename')) return payload;
-    } catch { /* ignore */ }
+    } catch { }
     return null;
   }
 
@@ -171,7 +224,7 @@
   }
 
   $effect(() => {
-    const count = messages.length;
+    const count = visibleMessages.length;
     if (count === 0) return;
 
     if (!initialJumpDone) {
@@ -180,7 +233,7 @@
       return;
     }
 
-    const lastMsg = messages[count - 1];
+    const lastMsg = visibleMessages[count - 1];
     const isOwnMessage = lastMsg?.sender === userNickname;
     const stillAnimating = Date.now() - lastAutoScrollAt < 900;
 
@@ -417,8 +470,8 @@ $effect(() => {
     if (!gifUrl) return;
     const uid = crypto.randomUUID();
     const specializedGifPayload = `P2P_MEDIA_GIF:${gifUrl}`;
-    messages = [...messages, { uid, sender: userNickname, channel: 'sbb-lounge', body: specializedGifPayload }];
-    await invoke('send_chat_message', { message: specializedGifPayload, uid });
+    messages = [...messages, { uid, sender: userNickname, channel: activeChannel, body: specializedGifPayload }];
+    await invoke('send_chat_message', { message: specializedGifPayload, uid, channel: activeChannel });
     showGifPanel = false;
     gifSearchQuery = '';
     searchResults = [];
@@ -930,9 +983,17 @@ $effect(() => {
     e.preventDefault();
     if (!inputMessage.trim()) return;
     const uid = crypto.randomUUID();
-    messages = [...messages, { uid, channel: activeChannel, sender: userNickname, body: inputMessage }];
-    await invoke('send_chat_message', { message: inputMessage, uid, channel: activeChannel });
+
+    const rawBody = inputMessage;
+      const outgoingBody = replyTo
+        ? `${REPLY_MARKER}${JSON.stringify({ t: replyTo.key })}\n${rawBody}`
+        : rawBody;
+
+    messages = [...messages, { uid, channel: activeChannel, sender: userNickname, body: outgoingBody }];
+    await invoke('send_chat_message', { message: outgoingBody, uid, channel: activeChannel });
+
     inputMessage = '';
+    replyTo = null;
     showEmojiPicker = false;
   }
 
@@ -976,6 +1037,13 @@ $effect(() => {
 
   function selectCircuitAddr(e) {
     e.target.select();
+  }
+
+  function displayReply(body) {
+    const parentKey = replyParentOf(body);
+    if (!parentKey) return { parentKey: null, text: body };
+    const rest = body.slice(body.indexOf('\n') + 1);
+    return { parentKey, text: rest };
   }
 
 </script>
@@ -1146,9 +1214,9 @@ $effect(() => {
     <div class="chat-container">
       <div class="message-log" bind:this={messageLogEl} onscroll={handleMessageLogScroll}>
         <div class="message-log-inner" bind:this={messageLogInnerEl}>
-          {#if messages.length === 0}
-            <div class="welcome-card">
-              <h1>Welcome to #sbb-lounge!</h1>
+            {#if visibleMessages.length === 0}
+              <div class="welcome-card">
+                <h1>Welcome to #{activeChannelName()}!</h1>
               <p>The file-broker link is running. Use the GIF launcher tab to share expressions.</p>
             </div>
           {/if}
@@ -1158,7 +1226,8 @@ $effect(() => {
             {@const fileInfo = extractFileInfo(body)}
             {@const isMine = senderName(msg) === userNickname}
             {@const mKey = messageKey(msg)}
-            <div class="message-card">
+            {@const replyInfo = displayReply(body)}
+            <div class="message-card" id={`msg-${mKey}`}>
               <div class="avatar-mock">{senderInitials(msg)}</div>
               <div class="message-content">
                 <span class="user-badge" class:self-user={isMine}>{senderName(msg)}</span>
@@ -1196,9 +1265,32 @@ $effect(() => {
                       {/if}
                     </div>
                   {:else}
-                    <p class="msg-body">{body}</p>
-                  {/if}
-
+                    {#if replyInfo.parentKey}
+                      {@const parent = messageByKey(replyInfo.parentKey)}
+                      {#if parent}
+                        <button
+                          type="button"
+                          class="reply-quote"
+                          onclick={() => {
+                            document.getElementById(`msg-${replyInfo.parentKey}`)?.scrollIntoView({
+                              behavior: 'smooth', block: 'center'
+                            });
+                          }}
+                        >
+                          <span class="reply-quote-bar" aria-hidden="true"></span>
+                          <span class="reply-quote-sender">{senderName(parent)}</span>
+                          <span class="reply-quote-text">{replyPreviewOf(parent)}</span>
+                        </button>
+                      {:else}
+                        <span class="reply-quote reply-quote-ghost">
+                          <span class="reply-quote-bar" aria-hidden="true"></span>
+                          <span class="reply-quote-sender">Original message</span>
+                          <span class="reply-quote-text">not available on this device</span>
+                        </span>
+                      {/if}
+                    {/if}
+                    <p class="msg-body">{replyInfo.text}</p>
+                    {/if}
                 {#if reactions[mKey]}
                   <div class="reaction-row">
                     {#each Object.entries(reactions[mKey]) as [emoji, users] (emoji)}
@@ -1226,6 +1318,13 @@ $effect(() => {
                     reactionPickerFor = reactionPickerFor === mKey ? null : mKey;
                   }}
                 >🙂</button>
+                <button
+                    type="button"
+                    class="reaction-add-btn"
+                    aria-label="Reply to message"
+                    onclick={() => startReply(msg)}
+                  >↩️</button>
+                </div>
 
                 {#if reactionPickerFor === mKey}
                   <div class="reaction-quick-bar" use:clickOutside={() => (reactionPickerFor = null)}>
@@ -1244,7 +1343,6 @@ $effect(() => {
                     >⋯</button>
                   </div>
                 {/if}
-              </div>
             </div>
           {/each}
         </div>
@@ -1270,11 +1368,6 @@ $effect(() => {
               {:else if searchResults.length === 0}
                 <span class="gif-notice">Type something to load matching expressions...</span>
             {/if}
-            {#if isSearchingGifs}
-              <span class="gif-notice">Querying decentralized channels...</span>
-            {:else if searchResults.length === 0}
-              <span class="gif-notice">Type something to load matching expressions...</span>
-            {/if}
             {#each searchResults as gif}
               {@const tileUrl = gifTileUrl(gif)}
               {#if tileUrl}
@@ -1292,6 +1385,7 @@ $effect(() => {
             <div class="emoji-picker-popover" use:clickOutside={closeEmojiPicker}>
               <div class="emoji-search-bar">
                 <input bind:value={emojiSearchQuery} placeholder="Search emoji…" autocomplete="off" />
+
                 {#if emojiSearchQuery}
                   <button type="button" class="emoji-search-clear" onclick={() => (emojiSearchQuery = '')}>✕</button>
                 {/if}
@@ -1333,6 +1427,17 @@ $effect(() => {
                   {/each}
                 </div>
               {/if}
+            </div>
+          {/if}
+
+          {#if replyTo}
+            <div class="reply-composer-bar">
+              <span class="reply-quote-bar" aria-hidden="true"></span>
+              <div class="reply-composer-info">
+                <span class="reply-composer-label">Replying to <strong>{replyTo.name}</strong></span>
+                <span class="reply-composer-preview">{replyTo.preview}</span>
+              </div>
+              <button type="button" class="reply-cancel-btn" onclick={cancelReply} aria-label="Cancel reply">✕</button>
             </div>
           {/if}
 
@@ -2430,5 +2535,82 @@ $effect(() => {
   .channel-title-btn:focus-visible .rename-hint {
     opacity: 1;
   }
+
+  .reply-quote {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: #0f1115;
+    border: 1px solid #1f232b;
+    border-radius: 4px;
+    padding: 3px 8px;
+    max-width: 400px;
+    cursor: pointer;
+    font-size: 12px;
+    color: #475569;
+    text-align: left;
+    transition: border-color 0.15s ease, color 0.15s ease;
+  }
+
+  .reply-quote:hover { border-color: #10b981; color: #94a3b8; }
+
+  .reply-quote-ghost { cursor: default; }
+  .reply-quote-ghost:hover { border-color: #1f232b; color: #475569; }
+
+  .reply-quote-bar {
+    width: 2px;
+    align-self: stretch;
+    background: #10b981;
+    border-radius: 1px;
+    flex-shrink: 0;
+  }
+
+  .reply-quote-sender { color: #10b981; font-weight: 600; flex-shrink: 0; }
+
+  .reply-quote-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .reply-composer-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: #0f1115;
+    border: 1px solid #1f232b;
+    border-left: 2px solid #10b981;
+    border-radius: 4px;
+    padding: 6px 10px;
+    margin-bottom: 8px;
+  }
+
+  .reply-composer-info {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .reply-composer-label { font-size: 12px; color: #94a3b8; }
+  .reply-composer-preview {
+    font-size: 12px;
+    color: #475569;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .reply-cancel-btn {
+    background: transparent;
+    border: none;
+    color: #475569;
+    font-size: 12px;
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: 4px;
+  }
+
+  .reply-cancel-btn:hover { color: #ef4444; background: #1f232b; }
 
   </style>
