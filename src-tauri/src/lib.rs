@@ -46,18 +46,18 @@ pub struct ChatBehavior {
 pub struct WireMessage {
     pub uid: Option<String>,
     pub timestamp: Option<String>,
-    pub channel: Option<String>,
+    pub room: Option<String>,
     pub sender: String,
     pub body: String,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct ChannelInfo {
+pub struct RoomInfo {
     pub id: String,
     pub name: String,
 }
 
-pub fn get_saved_channels(app_handle: &tauri::AppHandle) -> Vec<ChannelInfo> {
+pub fn get_saved_rooms(app_handle: &tauri::AppHandle) -> Vec<RoomInfo> {
     let mut config_dir = app_handle
         .path()
         .app_config_dir()
@@ -66,20 +66,20 @@ pub fn get_saved_channels(app_handle: &tauri::AppHandle) -> Vec<ChannelInfo> {
         config_dir.push(profile_suffix);
     }
     let mut path = config_dir;
-    path.push("channels.json");
+    path.push("rooms.json");
 
     fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| {
-            vec![ChannelInfo {
+            vec![RoomInfo {
                 id: "sbb-lounge".to_string(),
                 name: "sbb-lounge".to_string(),
             }]
         })
 }
 
-fn persist_channels(app_handle: &tauri::AppHandle, list: &[ChannelInfo]) -> Result<(), String> {
+fn persist_rooms(app_handle: &tauri::AppHandle, list: &[RoomInfo]) -> Result<(), String> {
     let mut config_dir = app_handle
         .path()
         .app_config_dir()
@@ -87,11 +87,11 @@ fn persist_channels(app_handle: &tauri::AppHandle, list: &[ChannelInfo]) -> Resu
     if let Ok(suffix) = std::env::var("APP_PROFILE") {
         config_dir.push(suffix);
     }
-    config_dir.push("channels.json");
+    config_dir.push("rooms.json");
     fs::write(&config_dir, serde_json::to_string(list).unwrap()).map_err(|e| e.to_string())
 }
 
-fn valid_channel_id(id: &str) -> bool {
+fn valid_room_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
         && id
@@ -139,7 +139,7 @@ pub struct ChatMessage {
     pub id: Option<i32>,
     pub uid: Option<String>,
     pub sender: String,
-    pub channel: String,
+    pub room: String,
     pub body: String,
     pub timestamp: String,
 }
@@ -153,14 +153,14 @@ pub struct AppState {
     pub relay_endpoint: Arc<Mutex<Option<RelayEndpoint>>>,
     pub relay_status: Arc<Mutex<RelayStatus>>,
     pub klipy_config: Arc<Mutex<Option<KlipyConfig>>>,
-    pub channels: Arc<Mutex<Vec<ChannelInfo>>>,
+    pub rooms: Arc<Mutex<Vec<RoomInfo>>>,
 }
 
 #[derive(Debug, Clone)]
 pub enum OutboundCommand {
     Chat {
         uid: String,
-        channel: String,
+        room: String,
         body: String,
     },
     FileTransfer {
@@ -318,7 +318,7 @@ pub fn init_database(app_handle: &tauri::AppHandle) -> Connection {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             uid TEXT,
             sender TEXT NOT NULL,
-            channel TEXT NOT NULL,
+            room TEXT NOT NULL,
             body TEXT NOT NULL,
             timestamp TEXT NOT NULL
         )",
@@ -340,7 +340,7 @@ fn get_profile(state: tauri::State<'_, AppState>) -> UserProfile {
 fn get_chat_history(state: tauri::State<'_, AppState>) -> Result<Vec<ChatMessage>, String> {
     let db = state.db.lock().unwrap();
     let mut stmt = db
-        .prepare("SELECT id, uid, sender, channel, body, timestamp FROM messages ORDER BY id ASC")
+        .prepare("SELECT id, uid, sender, room, body, timestamp FROM messages ORDER BY id ASC")
         .map_err(|e| e.to_string())?;
 
     let rows = stmt
@@ -349,7 +349,7 @@ fn get_chat_history(state: tauri::State<'_, AppState>) -> Result<Vec<ChatMessage
                 id: Some(row.get(0)?),
                 uid: row.get(1)?,
                 sender: row.get(2)?,
-                channel: row.get(3)?,
+                room: row.get(3)?,
                 body: row.get(4)?,
                 timestamp: row.get(5)?,
             })
@@ -455,16 +455,16 @@ fn remove_from_allow_list(
 fn send_chat_message(
     message: String,
     uid: Option<String>,
-    channel: Option<String>,
+    room: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     let uid = uid.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let channel = channel.unwrap_or_else(|| "sbb-lounge".to_string());
+    let room = room.unwrap_or_else(|| "sbb-lounge".to_string());
     state
         .tx
         .send(OutboundCommand::Chat {
             uid,
-            channel,
+            room,
             body: message,
         })
         .map_err(|e| e.to_string())
@@ -515,7 +515,7 @@ fn get_relay_endpoint(state: tauri::State<'_, AppState>) -> Option<RelayEndpoint
 #[tauri::command]
 fn save_klipy_key(api_key: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let key = api_key.trim().to_string();
-    // Light sanity check only — tighten if you know Klipy's exact format
+    // Klipy key validation
     if key.len() < 16 || key.len() > 128 || key.chars().any(|c| c.is_whitespace()) {
         return Err("That doesn't look like a valid API key".to_string());
     }
@@ -646,7 +646,7 @@ const CHUNK_SIZE: usize = 256 * 1024;
 fn send_file(
     path: String,
     uid: String,
-    channel: String,
+    room: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     let file_path = std::path::Path::new(&path);
@@ -668,7 +668,7 @@ fn send_file(
         .tx
         .send(OutboundCommand::Chat {
             uid: uid.clone(),
-            channel: channel.clone(),
+            room: room.clone(),
             body: format!("P2P_MEDIA_FILE:{}", info),
         })
         .map_err(|e| e.to_string())?;
@@ -769,50 +769,46 @@ fn open_local_file(path: String, _state: tauri::State<'_, AppState>) -> Result<(
 }
 
 #[tauri::command]
-fn get_channels(state: tauri::State<'_, AppState>) -> Vec<ChannelInfo> {
-    state.channels.lock().unwrap().clone()
+fn get_rooms(state: tauri::State<'_, AppState>) -> Vec<RoomInfo> {
+    state.rooms.lock().unwrap().clone()
 }
 
 #[tauri::command]
-fn create_channel(
+fn create_room(
     id: String,
     name: String,
     state: tauri::State<'_, AppState>,
-) -> Result<ChannelInfo, String> {
+) -> Result<RoomInfo, String> {
     let name = name.trim().to_string();
     if name.is_empty() || name.len() > 64 {
-        return Err("Channel name must be 1–64 characters".to_string());
+        return Err("Room name must be 1–64 characters".to_string());
     }
-    if !valid_channel_id(&id) {
-        return Err("Invalid channel id".to_string());
+    if !valid_room_id(&id) {
+        return Err("Invalid room id".to_string());
     }
-    let mut list = state.channels.lock().unwrap();
+    let mut list = state.rooms.lock().unwrap();
     if list.iter().any(|c| c.id == id) {
-        return Err("Channel already exists".to_string());
+        return Err("Room already exists".to_string());
     }
-    let info = ChannelInfo { id, name };
+    let info = RoomInfo { id, name };
     list.push(info.clone());
-    persist_channels(&state.app_handle, &list)?;
+    persist_rooms(&state.app_handle, &list)?;
     Ok(info)
 }
 
 #[tauri::command]
-fn rename_channel(
-    id: String,
-    name: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
+fn rename_room(id: String, name: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let name = name.trim().to_string();
     if name.is_empty() || name.len() > 64 {
-        return Err("Channel name must be 1–64 characters".to_string());
+        return Err("Room name must be 1–64 characters".to_string());
     }
-    let mut list = state.channels.lock().unwrap();
-    let channel = list
+    let mut list = state.rooms.lock().unwrap();
+    let room = list
         .iter_mut()
         .find(|c| c.id == id)
-        .ok_or_else(|| "Channel not found".to_string())?;
-    channel.name = name;
-    persist_channels(&state.app_handle, &list)
+        .ok_or_else(|| "Room not found".to_string())?;
+    room.name = name;
+    persist_rooms(&state.app_handle, &list)
 }
 
 pub fn start_p2p_backend(
@@ -1117,7 +1113,7 @@ pub fn start_p2p_backend(
                                         log::info!("📦 Queued file '{}' ({} bytes, {} chunks/peer, {} peers)", name, size, total, allow.len());
                                     }
                                 }
-                                OutboundCommand::Chat { uid, channel, body } => {
+                                OutboundCommand::Chat { uid, room, body } => {
                                     if let Some(app_state) = app_handle_clone.try_state::<AppState>() {
                                         let current_allow_list = app_state.allow_list.lock().unwrap().clone();
                                         let nickname = profile_clone.lock().unwrap().nickname.clone();
@@ -1125,7 +1121,7 @@ pub fn start_p2p_backend(
 
                                         if let Ok(db) = app_state.db.lock() {
                                             let _ = db.execute(
-                                                "INSERT INTO messages (uid, sender, channel, body, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
+                                                "INSERT INTO messages (uid, sender, room, body, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
                                                 rusqlite::params![uid.as_str(), nickname.as_str(), "sbb-lounge", body.as_str(), now.as_str()],
                                             );
                                         }
@@ -1164,7 +1160,7 @@ pub fn start_p2p_backend(
                                                     WireMessage {
                                                         uid: Some(uid.clone()),
                                                         timestamp: Some(now.clone()),
-                                                        channel: Some(channel.clone()),
+                                                        room: Some(room.clone()),
                                                         sender: nickname.clone(),
                                                         body: body.clone(),
                                                     },
@@ -1250,14 +1246,19 @@ pub fn start_p2p_backend(
                                     let _ = app_handle_clone.emit("relay-status-changed", status.clone());
                                 }
                             }
-
                             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                                 if let Some(pid) = peer_id {
                                     dial_cooldowns.remove(&pid);
                                 }
-                                log::warn!("Outgoing connection error to {:?}: {:?}", peer_id, error);
+                                match &error {
+                                    libp2p::swarm::DialError::Transport(errors) => {
+                                        log::debug!("Dial failed to {:?}: {:?}", peer_id, errors);
+                                    }
+                                    other => {
+                                        log::warn!("Outgoing connection error to {:?}: {:?}", peer_id, other);
+                                    }
+                                }
                             }
-
                             SwarmEvent::IncomingConnectionError { connection_id: _, error: _, .. } => {
                             }
                             SwarmEvent::ListenerClosed { addresses, reason, .. } => {
@@ -1284,7 +1285,7 @@ pub fn start_p2p_backend(
                                             let timestamp = request.timestamp.clone().unwrap_or_else(|| {
                                                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
                                             });
-                                            let chat_channel = request.channel.clone().unwrap_or_else(|| "sbb-lounge".to_string());
+                                            let chat_room = request.room.clone().unwrap_or_else(|| "sbb-lounge".to_string());
                                             if let Some(app_state) = app_handle_clone.try_state::<AppState>() {
                                                 if let Ok(db) = app_state.db.lock() {
                                                     let _ = db.execute(
@@ -1292,7 +1293,7 @@ pub fn start_p2p_backend(
                                                         rusqlite::params![
                                                             request.uid.as_deref(),
                                                             request.sender.as_str(),
-                                                            chat_channel.as_str(),
+                                                            chat_room.as_str(),
                                                             request.body.as_str(),
                                                             timestamp.as_str()
                                                         ],
@@ -1304,7 +1305,7 @@ pub fn start_p2p_backend(
                                                 id: None,
                                                 uid: request.uid,
                                                 sender: request.sender,
-                                                channel: chat_channel,
+                                                room: chat_room,
                                                 body: request.body,
                                                 timestamp,
                                             });
@@ -1491,8 +1492,8 @@ pub fn run() {
             let klipy_config = get_saved_klipy_config(&app_handle);
             let shared_klipy = Arc::new(Mutex::new(klipy_config));
 
-            let channels = get_saved_channels(&app_handle);
-            let shared_channels = Arc::new(Mutex::new(channels));
+            let rooms = get_saved_rooms(&app_handle);
+            let shared_rooms = Arc::new(Mutex::new(rooms));
 
             app.manage(AppState {
                 tx: network_tx,
@@ -1503,7 +1504,7 @@ pub fn run() {
                 relay_endpoint: shared_relay_endpoint,
                 relay_status: shared_relay_status,
                 klipy_config: shared_klipy,
-                channels: shared_channels,
+                rooms: shared_rooms,
             });
             Ok(())
         })
@@ -1527,9 +1528,9 @@ pub fn run() {
             save_klipy_key,
             get_klipy_key,
             clear_klipy_key,
-            get_channels,
-            create_channel,
-            rename_channel,
+            get_rooms,
+            create_room,
+            rename_room,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
