@@ -4,6 +4,11 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
+  import {
+    isPermissionGranted,
+    requestPermission,
+    sendNotification
+  } from '@tauri-apps/plugin-notification';
 
   let messages = $state([]);
   let inputMessage = $state('');
@@ -11,6 +16,12 @@
   let userPeerId = $state('');
   let editMode = $state(false);
   let nicknameInput = $state('');
+
+  // Notifications
+  let notificationsGranted = $state(false);
+  let notificationsEnabled = $state(true);
+  let mutedRooms = $state({});
+  let unreadByRoom = $state({});
 
   let allowedPeers = $state([]);
   let targetFriendId = $state('');
@@ -54,15 +65,15 @@
 
   const NEAR_BOTTOM_PX = 200;
 
-  // Channels
-  let channels = $state([]);
-  let activeChannel = $state('sbb-lounge');
-  let channelNameInput = $state('');
-  let editingChannel = $state(false);
-  let showNewChannel = $state(false);
-  let newChannelInput = $state('');
+  // Rooms
+  let rooms = $state([]);
+  let activeRoom = $state('sbb-lounge');
+  let roomNameInput = $state('');
+  let editingRoom = $state(false);
+  let showNewRoom = $state(false);
+  let newRoomInput = $state('');
 
-  const CHANNEL_MARKER = 'P2P_CHANNEL:';
+  const ROOM_MARKER = 'P2P_ROOM:';
 
   let replyTo = $state(null);
 
@@ -106,6 +117,91 @@
     return null;
   }
 
+  const NOTIF_PREFS_KEY = 'portsidepeer-notification-prefs';
+
+  function loadNotificationPrefs() {
+    try {
+      const prefs = JSON.parse(localStorage.getItem(NOTIF_PREFS_KEY) ?? '{}');
+      notificationsEnabled = typeof prefs.enabled === 'boolean' ? prefs.enabled : true;
+      mutedRooms = typeof prefs.muted === 'object' && prefs.muted ? prefs.muted : {};
+    } catch { }
+  }
+
+  function saveNotificationPrefs() {
+    try {
+      localStorage.setItem(
+        NOTIF_PREFS_KEY,
+        JSON.stringify({ enabled: notificationsEnabled, muted: mutedRooms })
+      );
+    } catch { }
+  }
+
+  function toggleNotifications() {
+    notificationsEnabled = !notificationsEnabled;
+    saveNotificationPrefs();
+  }
+
+  function toggleRoomMute(roomId) {
+    mutedRooms = { ...mutedRooms, [roomId]: !mutedRooms[roomId] };
+    saveNotificationPrefs();
+  }
+
+  function switchRoom(id) {
+    activeRoom = id;
+    scrollToBottom('auto');
+    if (unreadByRoom[id]) {
+      unreadByRoom = { ...unreadByRoom, [id]: 0 };
+    }
+  }
+
+  function roomIsVisible(room) {
+    return room === activeRoom && document.hasFocus();
+  }
+
+  function activeRoomNameFor(id) {
+    return rooms.find((c) => c.id === id)?.name ?? id;
+  }
+
+  function previewFor(msg) {
+    const body = displayBody(msg);
+    if (extractGifUrl(body)) return 'Sent a GIF';
+    const fileInfo = extractFileInfo(body);
+    if (fileInfo) return `Sent a file: ${fileInfo.name}`;
+    const replyParent = replyParentOf(body);
+    if (replyParent !== null) {
+      const text = body.slice(body.indexOf('\n') + 1);
+      return `↩ ${text.slice(0, 80) || 'Sent a reply'}`;
+    }
+    return body.slice(0, 80) || 'Sent a message';
+  }
+
+  function shouldNotify(msg) {
+    if (!notificationsGranted || !notificationsEnabled) return false;
+    if (senderName(msg) === userNickname) return false;
+    if (reactionPayloadOf(msg) || roomEventPayloadOf(msg)) return false;
+    if (mutedRooms[roomOf(msg)]) return false;
+    return !roomIsVisible(roomOf(msg));
+  }
+
+  function notifyNewMessage(msg) {
+    const room = roomOf(msg);
+
+    if (senderName(msg) !== userNickname && !roomIsVisible(room)) {
+      unreadByRoom = { ...unreadByRoom, [room]: (unreadByRoom[room] ?? 0) + 1 };
+    }
+
+    if (!shouldNotify(msg)) return;
+
+    try {
+      sendNotification({
+        title: `${senderName(msg)} • #${activeRoomNameFor(room)}`,
+        body: previewFor(msg)
+      });
+    } catch (err) {
+      console.error('[portsidepeer] notify failed', err);
+    }
+  }
+
   function replyParentOf(body) {
     if (typeof body !== 'string' || !body.startsWith(REPLY_MARKER)) return null;
     const newline = body.indexOf('\n');
@@ -119,90 +215,90 @@
 
   function slugify(name) {
     const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
-    return slug || 'channel';
+    return slug || 'room';
   }
 
-  function channelOf(msg) {
-    return typeof msg?.channel === 'string' && msg.channel ? msg.channel : 'sbb-lounge';
+  function roomOf(msg) {
+    return typeof msg?.room === 'string' && msg.room ? msg.room : 'sbb-lounge';
   }
 
-  function activeChannelName() {
-    return channels.find((c) => c.id === activeChannel)?.name ?? activeChannel;
+  function activeRoomName() {
+    return rooms.find((c) => c.id === activeRoom)?.name ?? activeRoom;
   }
 
-  function channelEventPayloadOf(msg) {
+  function roomEventPayloadOf(msg) {
     const body = displayBody(msg);
-    if (typeof body !== 'string' || !body.startsWith(CHANNEL_MARKER)) return null;
+    if (typeof body !== 'string' || !body.startsWith(ROOM_MARKER)) return null;
     try {
-      const payload = JSON.parse(body.slice(CHANNEL_MARKER.length));
+      const payload = JSON.parse(body.slice(ROOM_MARKER.length));
       if (typeof payload?.id === 'string' && typeof payload?.name === 'string' && (payload.a === 'create' || payload.a === 'rename')) return payload;
     } catch { }
     return null;
   }
 
-  async function applyChannelEvent(msg) {
-    const payload = channelEventPayloadOf(msg);
+  async function applyRoomEvent(msg) {
+    const payload = roomEventPayloadOf(msg);
     if (!payload) return;
-    if (payload.a === 'create' && !channels.some((c) => c.id === payload.id)) {
+    if (payload.a === 'create' && !rooms.some((c) => c.id === payload.id)) {
       try {
-        const info = await invoke('create_channel', { id: payload.id, name: payload.name });
-        channels = [...channels, info];
+        const info = await invoke('create_room', { id: payload.id, name: payload.name });
+        rooms = [...rooms, info];
       } catch {
-        channels = [...channels.filter((c) => c.id !== payload.id), { id: payload.id, name: payload.name }];
+        rooms = [...rooms.filter((c) => c.id !== payload.id), { id: payload.id, name: payload.name }];
       }
     } else if (payload.a === 'rename') {
       try {
-        await invoke('rename_channel', { id: payload.id, name: payload.name });
-        channels = channels.map((c) => (c.id === payload.id ? { ...c, name: payload.name } : c));
+        await invoke('rename_room', { id: payload.id, name: payload.name });
+        rooms = rooms.map((c) => (c.id === payload.id ? { ...c, name: payload.name } : c));
       } catch (err) {
-        console.error('[accord] channel rename failed', err);
+        console.error('[accord] room rename failed', err);
       }
     }
   }
 
-  async function createChannel(e) {
+  async function createRoom(e) {
     e.preventDefault();
-    const name = newChannelInput.trim();
+    const name = newRoomInput.trim();
     if (!name) return;
     let id = slugify(name);
-    if (channels.some((c) => c.id === id)) id = `${id}-${Math.random().toString(36).slice(2, 6)}`;
+    if (rooms.some((c) => c.id === id)) id = `${id}-${Math.random().toString(36).slice(2, 6)}`;
     try {
-      const info = await invoke('create_channel', { id, name });
-      channels = [...channels, info];
+      const info = await invoke('create_room', { id, name });
+      rooms = [...rooms, info];
       await invoke('send_chat_message', {
-        message: `${CHANNEL_MARKER}${JSON.stringify({ a: 'create', id, name })}`,
+        message: `${ROOM_MARKER}${JSON.stringify({ a: 'create', id, name })}`,
         uid: crypto.randomUUID(),
-        channel: activeChannel
+        room: activeRoom
       });
-      activeChannel = id;
-      showNewChannel = false;
-      newChannelInput = '';
+      activeRoom = id;
+      showNewRoom = false;
+      newRoomInput = '';
     } catch (err) {
       alert(err);
     }
   }
 
-  async function renameChannel(e) {
+  async function renameRoom(e) {
     e.preventDefault();
-    const name = channelNameInput.trim();
+    const name = roomNameInput.trim();
     if (!name) return;
-    const id = activeChannel;
+    const id = activeRoom;
     try {
-      await invoke('rename_channel', { id, name });
-      channels = channels.map((c) => (c.id === id ? { ...c, name } : c));
+      await invoke('rename_room', { id, name });
+      rooms = rooms.map((c) => (c.id === id ? { ...c, name } : c));
       await invoke('send_chat_message', {
-        message: `${CHANNEL_MARKER}${JSON.stringify({ a: 'rename', id, name })}`,
+        message: `${ROOM_MARKER}${JSON.stringify({ a: 'rename', id, name })}`,
         uid: crypto.randomUUID(),
-        channel: id
+        room: id
       });
-      editingChannel = false;
+      editingRoom = false;
     } catch (err) {
       alert(err);
     }
   }
 
   const visibleMessages = $derived.by(() =>
-    messages.filter((m) => channelOf(m) === activeChannel)
+    messages.filter((m) => roomOf(m) === activeRoom)
   );
 
   function isNearBottom() {
@@ -253,7 +349,7 @@
   });
 
 $effect(() => {
-   activeChannel;
+   activeRoom;
    scrollToBottom('auto');
  });
 
@@ -296,7 +392,7 @@ $effect(() => {
       const uid = crypto.randomUUID();
       const info = await invoke('send_file', { path: picked, uid });
       sentFiles = { ...sentFiles, [uid]: picked };
-      messages = [...messages, { uid, sender: userNickname, channel: 'sbb-lounge', body: `${FILE_MARKER}${JSON.stringify(info)}` }];
+      messages = [...messages, { uid, sender: userNickname, room: activeRoom, body: `${FILE_MARKER}${JSON.stringify(info)}` }];
     } catch (err) {
       alert(`File share failed: ${err}`);
     }
@@ -470,8 +566,8 @@ $effect(() => {
     if (!gifUrl) return;
     const uid = crypto.randomUUID();
     const specializedGifPayload = `P2P_MEDIA_GIF:${gifUrl}`;
-    messages = [...messages, { uid, sender: userNickname, channel: activeChannel, body: specializedGifPayload }];
-    await invoke('send_chat_message', { message: specializedGifPayload, uid, channel: activeChannel });
+    messages = [...messages, { uid, sender: userNickname, room: activeRoom, body: specializedGifPayload }];
+    await invoke('send_chat_message', { message: specializedGifPayload, uid, room: activeRoom });
     showGifPanel = false;
     gifSearchQuery = '';
     searchResults = [];
@@ -519,7 +615,7 @@ $effect(() => {
         '🏒','🏓','🏸','🥊','🥋','⛳','🏹','🎣','🥅','🎮',
         '🕹️','🎲','🧩','🎯','🎰','🪀','🪁','🎤','🎧','🎼',
         '🎹','🥁','🎷','🎺','🎸','🎻','🎬','🎨','🎭','🎪',
-        '🎟️','🎫', '💩'
+        '🎟️','🎫'
       ]
     },
     {
@@ -628,6 +724,7 @@ $effect(() => {
     '💀': 'skull dead death',
     '🤖': 'robot bot',
     '👻': 'ghost spooky halloween',
+    '💩': 'poo poop',
     // People & Gestures
     '👍': 'thumbs up yes ok approve like',
     '👎': 'thumbs down no disapprove',
@@ -659,7 +756,6 @@ $effect(() => {
     '🎤': 'mic microphone sing karaoke',
     '🎸': 'guitar music rock',
     '🎬': 'movie film',
-    '💩': 'poop poo',
     // Animals & Nature
     '🐶': 'dog puppy',
     '🐱': 'cat kitten',
@@ -883,6 +979,7 @@ $effect(() => {
     };
 
     async function initializeApp() {
+      loadNotificationPrefs();
       const profile = await safe('get_profile', () => invoke('get_profile'));
       if (profile) {
         userNickname = profile.nickname ?? 'Guest';
@@ -892,12 +989,23 @@ $effect(() => {
         userNickname = 'Guest';
       }
 
+      (async () => {
+        try {
+          if (!(await isPermissionGranted())) {
+            await requestPermission();
+          }
+          notificationsGranted = await isPermissionGranted();
+        } catch {
+          notificationsGranted = false;
+        }
+      })();
+
       const list = await safe('get_allow_list', () => invoke('get_allow_list'));
       allowedPeers = Array.isArray(list) ? list : [];
 
-      const chans = await safe('get_channels', () => invoke('get_channels'));
-      channels = Array.isArray(chans) && chans.length ? chans : [{ id: 'sbb-lounge', name: 'sbb-lounge' }];
-      activeChannel = channels[0].id;
+      const chans = await safe('get_rooms', () => invoke('get_rooms'));
+      rooms = Array.isArray(chans) && chans.length ? chans : [{ id: 'sbb-lounge', name: 'sbb-lounge' }];
+      activeRoom = rooms[0].id;
 
       const historicalLogs = await safe('get_chat_history', () => invoke('get_chat_history'));
       const allLogs = Array.isArray(historicalLogs) ? historicalLogs : [];
@@ -907,7 +1015,7 @@ $effect(() => {
       for (const m of allLogs) {
         if (!m || typeof m !== 'object') continue;
         if (reactionPayloadOf(m)) { applyReactionEvent(m); continue; }
-        if (channelEventPayloadOf(m)) { applyChannelEvent(m); continue; }
+        if (roomEventPayloadOf(m)) { applyRoomEvent(m); continue; }
         chatOnly.push(m);
       }
       messages = chatOnly;
@@ -954,14 +1062,20 @@ $effect(() => {
         delete next[p.id];
         fileProgress = next;
       });
+
       await addListener('chat-msg', (event) => {
         const incoming = event.payload;
         if (incoming && typeof incoming === 'object') {
           if (incoming.uid && messages.some((m) => m.uid === incoming.uid)) return;
+          notifyNewMessage(incoming);
           if (reactionPayloadOf(incoming)) { applyReactionEvent(incoming); return; }
-          if (channelEventPayloadOf(incoming)) { applyChannelEvent(incoming); return; }
+          if (roomEventPayloadOf(incoming)) { applyRoomEvent(incoming); return; }
           messages = [...messages, incoming];
         }
+      });
+
+      window.addEventListener('focus', () => {
+        unreadByRoom = { ...unreadByRoom, [activeRoom]: 0 };
       });
 
       await addListener('peer-discovered', (event) => {
@@ -989,8 +1103,8 @@ $effect(() => {
         ? `${REPLY_MARKER}${JSON.stringify({ t: replyTo.key })}\n${rawBody}`
         : rawBody;
 
-    messages = [...messages, { uid, channel: activeChannel, sender: userNickname, body: outgoingBody }];
-    await invoke('send_chat_message', { message: outgoingBody, uid, channel: activeChannel });
+    messages = [...messages, { uid, room: activeRoom, sender: userNickname, body: outgoingBody }];
+    await invoke('send_chat_message', { message: outgoingBody, uid, room: activeRoom });
 
     inputMessage = '';
     replyTo = null;
@@ -1092,28 +1206,57 @@ $effect(() => {
       </div>
 
       <div class="panel-section">
-        <h4>Channels ({channels.length})</h4>
-        <div class="channel-list">
-          {#each channels as channel (channel.id)}
-            <button
+        <h4>Rooms ({rooms.length})</h4>
+        <div class="room-list">
+          {#each rooms as room (room.id)}
+              <div class="room-row-wrap">
+              <button
               type="button"
-              class="channel-row"
-              class:active={channel.id === activeChannel}
-              onclick={() => (activeChannel = channel.id)}
+              class="room-row"
+              class:active={room.id === activeRoom}
+              onclick={() => switchRoom(room.id)}
             >
               <span class="hash-tag">#</span>
-              <span class="channel-name">{channel.name}</span>
+              <span class="room-name">{room.name}</span>
+              {#if unreadByRoom[room.id]}
+                <span class="room-badge">{unreadByRoom[room.id]}</span>
+              {/if}
             </button>
+            <button
+                type="button"
+                class="room-mute-btn"
+                class:muted={mutedRooms[room.id]}
+                title={mutedRooms[room.id] ? 'Unmute room' : 'Mute room'}
+                aria-label={mutedRooms[room.id]
+                    ? `Unmute ${room.name}`
+                    : `Mute ${room.name}`}
+                onclick={() => toggleRoomMute(room.id)}
+                >{mutedRooms[room.id] ? '🔕' : '🔔'}</button>
+              </div>
           {/each}
         </div>
-        {#if showNewChannel}
-          <form onsubmit={createChannel} class="sidebar-form" style="margin-top: 8px;">
-            <input bind:value={newChannelInput} placeholder="Add new channel!" autocomplete="off" />
+        {#if showNewRoom}
+          <form onsubmit={createRoom} class="sidebar-form" style="margin-top: 8px;">
+            <input bind:value={newRoomInput} placeholder="Add new room!" autocomplete="off" />
             <button type="submit">Create</button>
           </form>
         {:else}
-          <button type="button" class="add-channel-btn" onclick={() => (showNewChannel = true)}>+ Add Channel</button>
+          <button type="button" class="add-room-btn" onclick={() => (showNewRoom = true)}>+ Add Room</button>
         {/if}
+      </div>
+
+      <div class="panel-section">
+        <h4>Notifications</h4>
+        <button
+          type="button"
+          class="notif-toggle-row"
+          onclick={toggleNotifications}
+        >
+          <span class="notif-toggle-label">{notificationsEnabled ? '🔔 Enabled' : '🔕 Muted'}</span>
+          <span class="notif-toggle-track" class:on={notificationsEnabled}>
+            <span class="notif-toggle-thumb"></span>
+          </span>
+        </button>
       </div>
 
       <div class="panel-section">
@@ -1190,20 +1333,20 @@ $effect(() => {
   <section class="main-workspace">
     <header class="app-header">
       <div class="server-info">
-          {#if editingChannel}
-            <form onsubmit={renameChannel} class="channel-rename-form">
-              <input bind:value={channelNameInput} class="edit-input" />
+          {#if editingRoom}
+            <form onsubmit={renameRoom} class="room-rename-form">
+              <input bind:value={roomNameInput} class="edit-input" />
               <button type="submit" class="save-btn">✓</button>
-              <button type="button" onclick={() => (editingChannel = false)} class="cancel-btn">✕</button>
+              <button type="button" onclick={() => (editingRoom = false)} class="cancel-btn">✕</button>
             </form>
           {:else}
             <button
               type="button"
-              class="channel-title-btn"
-              onclick={() => { channelNameInput = activeChannelName(); editingChannel = true; }}
+              class="room-title-btn"
+              onclick={() => { roomNameInput = activeRoomName(); editingRoom = true; }}
             >
               <span class="hash-tag">#</span>
-              <span class="channel-title-text">{activeChannelName()}</span>
+              <span class="room-title-text">{activeRoomName()}</span>
               <span class="rename-hint" aria-hidden="true">✏️</span>
             </button>
           {/if}
@@ -1216,7 +1359,7 @@ $effect(() => {
         <div class="message-log-inner" bind:this={messageLogInnerEl}>
             {#if visibleMessages.length === 0}
               <div class="welcome-card">
-                <h1>Welcome to #{activeChannelName()}!</h1>
+                <h1>Welcome to #{activeRoomName()}!</h1>
               <p>The file-broker link is running. Use the GIF launcher tab to share expressions.</p>
             </div>
           {/if}
@@ -1364,7 +1507,7 @@ $effect(() => {
             {#if !klipyApiKey}
                 <span class="gif-notice">GIF search needs a Klipy API key — add one under GIF Search in the sidebar</span>
               {:else if isSearchingGifs}
-                <span class="gif-notice">Querying decentralized channels...</span>
+                <span class="gif-notice">Querying decentralized rooms...</span>
               {:else if searchResults.length === 0}
                 <span class="gif-notice">Type something to load matching expressions...</span>
             {/if}
@@ -1821,13 +1964,6 @@ $effect(() => {
     align-items: center;
     justify-content: space-between;
     width: 100%;
-  }
-
-  .server-info h3 {
-    margin: 0;
-    font-size: 15px;
-    color: #e2e8f0;
-    font-weight: 600;
   }
 
   .hash-tag {
@@ -2462,9 +2598,9 @@ $effect(() => {
 
   .file-progress-label { color: #10b981; font-size: 11px; font-weight: 700; flex-shrink: 0; }
 
-  .channel-list { display: flex; flex-direction: column; gap: 2px; }
+  .room-list { display: flex; flex-direction: column; gap: 2px; }
 
-  .channel-row {
+  .room-row {
     display: flex;
     align-items: center;
     gap: 6px;
@@ -2479,13 +2615,13 @@ $effect(() => {
     transition: background-color 0.15s ease, color 0.15s ease;
   }
 
-  .channel-row:hover { background: #1f232b; color: #e2e8f0; }
-  .channel-row.active { background: #1f232b; color: #10b981; font-weight: 600; }
+  .room-row:hover { background: #1f232b; color: #e2e8f0; }
+  .room-row.active { background: #1f232b; color: #10b981; font-weight: 600; }
 
-  .channel-row .hash-tag { font-size: 14px; }
-  .channel-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .room-row .hash-tag { font-size: 14px; }
+  .room-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-  .add-channel-btn {
+  .add-room-btn {
     width: 100%;
     margin-top: 6px;
     background: transparent;
@@ -2497,12 +2633,12 @@ $effect(() => {
     cursor: pointer;
     transition: border-color 0.15s ease, color 0.15s ease;
   }
-  .add-channel-btn:hover { border-color: #10b981; color: #10b981; }
+  .add-room-btn:hover { border-color: #10b981; color: #10b981; }
 
-  .channel-rename-form { display: flex; gap: 6px; align-items: center; }
+  .room-rename-form { display: flex; gap: 6px; align-items: center; }
 
   .rename-hint { opacity: 0; font-size: 11px; transition: opacity 0.15s ease; }
-  .channel-title-btn {
+  .room-title-btn {
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -2518,9 +2654,9 @@ $effect(() => {
     text-align: left;
   }
 
-  .channel-title-btn:hover { background: #1f232b; }
+  .room-title-btn:hover { background: #1f232b; }
 
-  .channel-title-text {
+  .room-title-text {
     font-size: 15px;
     font-weight: 600;
   }
@@ -2531,8 +2667,8 @@ $effect(() => {
     transition: opacity 0.15s ease;
   }
 
-  .channel-title-btn:hover .rename-hint,
-  .channel-title-btn:focus-visible .rename-hint {
+  .room-title-btn:hover .rename-hint,
+  .room-title-btn:focus-visible .rename-hint {
     opacity: 1;
   }
 
@@ -2612,5 +2748,88 @@ $effect(() => {
   }
 
   .reply-cancel-btn:hover { color: #ef4444; background: #1f232b; }
+
+  .notif-toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    background: transparent;
+    border: none;
+    color: #94a3b8;
+    font-size: 13px;
+    cursor: pointer;
+    padding: 4px 0;
+  }
+
+  .notif-toggle-label { color: #e2e8f0; }
+
+  .notif-toggle-track {
+    width: 34px;
+    height: 18px;
+    border-radius: 9px;
+    background: #1f232b;
+    border: 1px solid #334155;
+    position: relative;
+    transition: background-color 0.15s ease, border-color 0.15s ease;
+    flex-shrink: 0;
+  }
+
+  .notif-toggle-track.on {
+    background: #10b981;
+    border-color: #10b981;
+  }
+
+  .notif-toggle-thumb {
+    position: absolute;
+    top: 1px;
+    left: 1px;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #e2e8f0;
+    transition: transform 0.15s ease;
+  }
+
+  .notif-toggle-track.on .notif-toggle-thumb {
+    transform: translateX(16px);
+  }
+
+  .room-row-wrap {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+  }
+
+  .room-row { flex: 1; min-width: 0; }
+
+  .room-badge {
+    margin-left: auto;
+    background: #10b981;
+    color: #090d16;
+    font-size: 10px;
+    font-weight: 700;
+    border-radius: 8px;
+    padding: 1px 6px;
+    min-width: 16px;
+    text-align: center;
+    flex-shrink: 0;
+  }
+
+  .room-mute-btn {
+    background: transparent;
+    border: none;
+    font-size: 11px;
+    cursor: pointer;
+    padding: 2px 4px;
+    border-radius: 4px;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+    flex-shrink: 0;
+  }
+
+  .room-row-wrap:hover .room-mute-btn { opacity: 0.6; }
+  .room-mute-btn:hover { opacity: 1 !important; background: #1f232b; }
+  .room-mute-btn.muted { opacity: 0.8; }
 
   </style>

@@ -1,6 +1,6 @@
 {
   "name": "portsidepeer",
-  "version": "0.1.2",
+  "version": "0.1.4",
   "description": "",
   "type": "module",
   "scripts": {
@@ -15,6 +15,7 @@
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-dialog": "^2.7.3",
+    "@tauri-apps/plugin-notification": "^2.5.1",
     "@tauri-apps/plugin-opener": "^2",
     "emoji-picker-element": "^1.29.1"
   },
