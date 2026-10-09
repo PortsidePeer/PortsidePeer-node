@@ -13,6 +13,7 @@ Decentralized peer to peer chat app built for the user and not for data centers.
 - React to messages with emojis, emoji search, etc.
 - Send Files to everyone in the chatroom.
 - Message history stored locally.
+- Notifications of messages while away
 
 ### How it works
 
@@ -32,8 +33,9 @@ For some reason for Arch based distros this is needed.
 
 `NO_STRIP=true npm run tauri build`
 
-### Releases (soon)
+### Releases 
 
+[Latest release](https://github.com/PortsidePeer/PortsidePeer-node/releases/latest)
 
 ## License
 
