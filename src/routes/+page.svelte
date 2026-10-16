@@ -44,6 +44,12 @@
   let showRelayPanel = $state(false);
   let reactions = $state({});
   let reactionPickerFor = $state(null);
+  let reactionPickerFlip = $state(false);
+  let recentEmoji = $state([]);
+
+  const RECENT_EMOJI_KEY = 'portsidepeer-recent-emoji';
+  const RECENT_EMOJI_MAX = 16;
+
   let emojiMode = $state('compose');
   let reactTarget = $state(null);
   let emojiSearchQuery = $state('');
@@ -81,7 +87,10 @@
 
   function replyPreviewOf(msg) {
     const body = displayBody(msg);
-    return extractGifUrl(body) ? 'a GIF' : extractFileInfo(body) ? 'a file' : body.slice(0, 80);
+      if (extractGifUrl(body)) return 'a GIF';
+      if (extractImageUrl(body)) return 'an image';
+      if (extractFileInfo(body)) return 'a file';
+      return body.slice(0, 80);
   }
 
   function startReply(msg) {
@@ -165,6 +174,7 @@
   function previewFor(msg) {
     const body = displayBody(msg);
     if (extractGifUrl(body)) return 'Sent a GIF';
+    if (extractImageUrl(body)) return 'Sent an image';
     const fileInfo = extractFileInfo(body);
     if (fileInfo) return `Sent a file: ${fileInfo.name}`;
     const replyParent = replyParentOf(body);
@@ -181,6 +191,26 @@
     if (reactionPayloadOf(msg) || roomEventPayloadOf(msg)) return false;
     if (mutedRooms[roomOf(msg)]) return false;
     return !roomIsVisible(roomOf(msg));
+  }
+
+  function loadRecentEmoji() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(RECENT_EMOJI_KEY) ?? '[]');
+      recentEmoji = Array.isArray(saved)
+        ? saved.filter((e) => typeof e === 'string').slice(0, RECENT_EMOJI_MAX)
+        : [];
+    } catch { }
+  }
+
+  function saveRecentEmoji() {
+    try {
+      localStorage.setItem(RECENT_EMOJI_KEY, JSON.stringify(recentEmoji));
+    } catch { }
+  }
+
+  function pushRecentEmoji(emoji) {
+    recentEmoji = [emoji, ...recentEmoji.filter((e) => e !== emoji)].slice(0, RECENT_EMOJI_MAX);
+    saveRecentEmoji();
   }
 
   function notifyNewMessage(msg) {
@@ -418,6 +448,15 @@ $effect(() => {
     if (idx === -1) return null;
     const url = body.slice(idx + GIF_MARKER.length).trim();
     return url || null;
+  }
+
+  // Image urls
+  function extractImageUrl(body) {
+    const text = typeof body === 'string' ? body.trim() : '';
+    if (!text || /\s/.test(text)) return null;
+    if (!/^https:\/\//i.test(text)) return null;
+    if (/[<>"'`\\]/.test(text)) return null;
+    return /\.(png|jpe?g|gif|webp|avif|bmp)(\?|#|$)/i.test(text) ? text : null;
   }
 
   // Reactions
@@ -883,6 +922,7 @@ $effect(() => {
   }
 
   function pickEmoji(emoji) {
+    pushRecentEmoji(emoji);
     if (emojiMode === 'react' && reactTarget) {
       toggleReaction(reactTarget.key, emoji);
       closeEmojiPicker();
@@ -980,6 +1020,7 @@ $effect(() => {
 
     async function initializeApp() {
       loadNotificationPrefs();
+      loadRecentEmoji();
       const profile = await safe('get_profile', () => invoke('get_profile'));
       if (profile) {
         userNickname = profile.nickname ?? 'Guest';
@@ -1192,10 +1233,6 @@ $effect(() => {
             <p class="relay-notice">⚠️ Restart required to connect</p>
           {/if}
 
-          <form onsubmit={dialPeerViaRelay} class="sidebar-form" style="margin-top: 8px;">
-            <input bind:value={dialAddress} placeholder="Dial: /p2p/<relay>/p2p-circuit/p2p/<peer>" autocomplete="off" />
-            <button type="submit">Dial Peer</button>
-          </form>
         {:else}
           <form onsubmit={saveRelay} class="sidebar-form">
             <input bind:value={relayPeerId} placeholder="Relay Peer ID..." autocomplete="off" />
@@ -1366,6 +1403,7 @@ $effect(() => {
           {#each visibleMessages as msg}
             {@const body = displayBody(msg)}
             {@const gifUrl = extractGifUrl(body)}
+            {@const imgUrl = extractImageUrl(body)}
             {@const fileInfo = extractFileInfo(body)}
             {@const isMine = senderName(msg) === userNickname}
             {@const mKey = messageKey(msg)}
@@ -1384,12 +1422,27 @@ $effect(() => {
                         <div class="gif-media-frame">
                           <img
                             src={gifUrl}
-                            alt="Media shared over libp2p"
+                            alt={`GIF from ${senderName(msg)}`}
                             loading="lazy"
                             onerror={() => handleMediaError(gifUrl)}
                           />
                         </div>
                       {/if}
+                {:else if imgUrl}
+                        {#if failedMediaUrls.includes(imgUrl)}
+                        <a class="gif-fallback-link" href={imgUrl} target="_blank" rel="noopener noreferrer" title={imgUrl}>
+                            Image unavailable in-app — click to open in browser
+                        </a>
+                        {:else}
+                        <div class="gif-media-frame">
+                            <img
+                            src={imgUrl}
+                            alt={`Image from ${senderName(msg)}`}
+                            loading="lazy"
+                            onerror={() => handleMediaError(imgUrl)}
+                            />
+                        </div>
+                        {/if}
                   {:else if fileInfo}
                     <div class="file-card">
                       <span class="file-icon">📄</span>
@@ -1442,7 +1495,7 @@ $effect(() => {
                         class="reaction-pill"
                         class:mine={users.some((u) => u.p === me().p)}
                         title={users.map((u) => u.n).join(', ')}
-                        onclick={() => toggleReaction(mKey, emoji)}
+                        onclick={() => {pushRecentEmoji(emoji); toggleReaction(mKey, emoji)}}
                       >
                         <span>{emoji}</span><span class="reaction-count">{users.length}</span>
                       </button>
@@ -1458,7 +1511,18 @@ $effect(() => {
                   aria-label="Add reaction"
                   onclick={(e) => {
                     e.stopPropagation();
-                    reactionPickerFor = reactionPickerFor === mKey ? null : mKey;
+                    if (reactionPickerFor === mKey) {
+                      reactionPickerFor = null;
+                    } else {
+                      const card = document.getElementById(`msg-${mKey}`);
+                      const log = messageLogEl;
+                      if (card && log) {
+                        const cardTop = card.getBoundingClientRect().top;
+                        const logBottom = log.getBoundingClientRect().bottom;
+                        reactionPickerFlip = cardTop > logBottom - 140;
+                      }
+                      reactionPickerFor = mKey;
+                    }
                   }}
                 >🙂</button>
                 <button
@@ -1470,12 +1534,27 @@ $effect(() => {
                 </div>
 
                 {#if reactionPickerFor === mKey}
-                  <div class="reaction-quick-bar" use:clickOutside={() => (reactionPickerFor = null)}>
+                  <div class="reaction-quick-bar"
+                    class:flip-up={reactionPickerFlip}
+                    use:clickOutside={() => (reactionPickerFor = null)}
+                  >
+                    {#if recentEmoji.length > 0}
+                        <div class="quick-bar-recent">
+                            {#each recentEmoji.slice(0, 5) as emoji (emoji)}
+                            <button
+                                type="button"
+                                class="reaction-quick-emoji"
+                                onclick={() => { pushRecentEmoji(emoji); toggleReaction(mKey, emoji); reactionPickerFor = null; }}
+                            >{emoji}</button>
+                            {/each}
+                        </div>
+                        <span class="quick-bar-divider" aria-hidden="true"></span>
+                    {/if}
                     {#each QUICK_REACTIONS as emoji}
                       <button
                         type="button"
                         class="reaction-quick-emoji"
-                        onclick={() => { toggleReaction(mKey, emoji); reactionPickerFor = null; }}
+                        onclick={() => { pushRecentEmoji(emoji); toggleReaction(mKey, emoji); reactionPickerFor = null; }}
                       >{emoji}</button>
                     {/each}
                     <button
@@ -1540,6 +1619,21 @@ $effect(() => {
                   <span class="emoji-react-preview" title={reactTarget?.preview}>
                     {reactTarget?.preview?.slice(0, 60) ?? ''}
                   </span>
+                </div>
+              {/if}
+
+              {#if !emojiSearchResults && recentEmoji.length > 0}
+                <div class="emoji-recents-row">
+                    <span class="emoji-recents-label">Recent</span>
+                    <div class="emoji-recents-grid">
+                        {#each recentEmoji as emoji (emoji)}
+                          <button
+                            type="button"
+                            class="emoji-cell emoji-recent-cell"
+                            onclick={() => pickEmoji(emoji)}
+                          >{emoji}</button>
+                        {/each}
+                    </div>
                 </div>
               {/if}
 
@@ -1620,6 +1714,7 @@ $effect(() => {
                 e.stopPropagation();
                 emojiMode = 'compose';
                 reactTarget = null;
+                reactionPickerFor = null;
                 showEmojiPicker = !showEmojiPicker;
               }}
               aria-label="Toggle emoji picker"
@@ -1637,6 +1732,15 @@ $effect(() => {
 
 <style>
 
+ body, html {
+  margin: 0 !important;
+  padding: 0 !important;
+  background-color: #090d16;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+ }
   .app-layout {
     display: flex;
     width: 100vw;
@@ -1985,6 +2089,7 @@ $effect(() => {
   }
 
   .chat-container {
+    padding: 20px 20px 0;
     display: flex;
     flex-direction: column;
     flex-grow: 1;
@@ -1996,6 +2101,7 @@ $effect(() => {
   .message-log {
     flex-grow: 1;
     overflow-y: auto;
+    padding-bottom: 20px;
   }
 
   .message-log-inner {
@@ -2267,7 +2373,7 @@ $effect(() => {
   .emoji-picker-popover {
     position: absolute;
     bottom: 100%;
-    right: 16px;
+    right: 32px;
     z-index: 1000;
     margin-bottom: 8px;
     width: 328px;
@@ -2332,6 +2438,53 @@ $effect(() => {
   }
 
   .emoji-cell:hover {
+    background: #1f232b;
+    transform: scale(1.2);
+  }
+
+  .quick-bar-recent {
+    display: flex;
+    gap: 2px;
+  }
+
+  .quick-bar-divider {
+    width: 1px;
+    align-self: stretch;
+    background: #1f232b;
+    margin: 2px 3px;
+  }
+
+  .emoji-recents-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px 6px 12px;
+    background: #090d16;
+    border-bottom: 1px solid #1f232b;
+    flex-shrink: 0;
+  }
+
+  .emoji-recents-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    color: #475569;
+    letter-spacing: 0.5px;
+    flex-shrink: 0;
+  }
+
+  .emoji-recents-grid {
+    display: flex;
+    gap: 2px;
+    overflow-x: auto;
+    flex: 1;
+  }
+
+  .emoji-recent-cell {
+    font-size: 17px;
+    padding: 2px 0;
+  }
+
+  .emoji-recent-cell:hover {
     background: #1f232b;
     transform: scale(1.2);
   }
@@ -2458,8 +2611,8 @@ $effect(() => {
   .reaction-quick-bar {
     position: absolute;
     top: calc(100% + 4px);
-    right: 0;
-    z-index: 30;
+    right: 28px;
+    z-index: 1100;
     display: flex;
     gap: 2px;
     padding: 4px;
@@ -2467,6 +2620,11 @@ $effect(() => {
     border: 1px solid #1f232b;
     border-radius: 6px;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  }
+
+  .reaction-quick-bar.flip-up {
+    top: auto;
+    bottom: calc(100% + 4px);
   }
 
   .reaction-quick-emoji {
