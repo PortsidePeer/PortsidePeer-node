@@ -646,9 +646,10 @@ const CHUNK_SIZE: usize = 256 * 1024;
 fn send_file(
     path: String,
     uid: String,
-    room: String,
+    room: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
+    let room = room.unwrap_or_else(|| "sbb-lounge".to_string());
     let file_path = std::path::Path::new(&path);
     let name = file_path
         .file_name()
@@ -668,7 +669,7 @@ fn send_file(
         .tx
         .send(OutboundCommand::Chat {
             uid: uid.clone(),
-            room: room.clone(),
+            room,
             body: format!("P2P_MEDIA_FILE:{}", info),
         })
         .map_err(|e| e.to_string())?;
@@ -797,6 +798,35 @@ fn create_room(
 }
 
 #[tauri::command]
+fn save_temp_media(
+    data: Vec<u8>,
+    ext: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let ext = match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "bmp" => ext,
+        _ => "png".to_string(),
+    };
+
+    let mut dir = state
+        .app_handle
+        .path()
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?;
+    dir.push("media");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    let path = dir.join(format!(
+        "{}_{}.{}",
+        chrono::Local::now().format("%Y%m%d_%H%M%S"),
+        uuid::Uuid::new_v4().simple(),
+        ext
+    ));
+    fs::write(&path, data).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
 fn rename_room(id: String, name: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let name = name.trim().to_string();
     if name.is_empty() || name.len() > 64 {
@@ -809,6 +839,28 @@ fn rename_room(id: String, name: String, state: tauri::State<'_, AppState>) -> R
         .ok_or_else(|| "Room not found".to_string())?;
     room.name = name;
     persist_rooms(&state.app_handle, &list)
+}
+
+#[tauri::command]
+fn get_local_image_path(
+    transfer_id: String,
+    name: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let mut dir = state
+        .app_handle
+        .path()
+        .app_config_dir()
+        .map_err(|e| e.to_string())?;
+    if let Ok(suffix) = std::env::var("APP_PROFILE") {
+        dir.push(suffix);
+    }
+    dir.push("files");
+    let path = dir.join(format!("{}_{}", transfer_id, sanitize_filename(&name)));
+    if !path.exists() {
+        return Err("not downloaded yet".to_string());
+    }
+    Ok(path.to_string_lossy().to_string())
 }
 
 pub fn start_p2p_backend(
@@ -1536,6 +1588,8 @@ pub fn run() {
             get_rooms,
             create_room,
             rename_room,
+            save_temp_media,
+            get_local_image_path,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

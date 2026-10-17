@@ -4,6 +4,9 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
+  import { getCurrentWebview } from '@tauri-apps/api/webview';
+  import { convertFileSrc } from '@tauri-apps/api/core';
+
   import {
     isPermissionGranted,
     requestPermission,
@@ -90,7 +93,12 @@
       if (extractGifUrl(body)) return 'a GIF';
       if (extractImageUrl(body)) return 'an image';
       if (extractFileInfo(body)) return 'a file';
-      return body.slice(0, 80);
+      const replyParent = replyParentOf(body);
+      if (replyParent !== null) {
+        const text = body.slice(body.indexOf('\n') + 1);
+        return text.slice(0, 80) || 'a reply';
+      }
+    return body.slice(0, 80);
   }
 
   function startReply(msg) {
@@ -105,6 +113,38 @@
 
   function cancelReply() {
     replyTo = null;
+  }
+
+  const IMAGE_MARKER = 'P2P_MEDIA_IMAGE:';
+
+  let imageSrcs = $state({});
+
+  function extractImageInfo(body) {
+    if (typeof body !== 'string' || !body.startsWith(IMAGE_MARKER)) return null;
+    try {
+      const info = JSON.parse(body.slice(IMAGE_MARKER.length));
+      if (typeof info?.id === 'string' && typeof info?.name === 'string') return info;
+    } catch {}
+    return null;
+  }
+
+  function isImageFile(name) {
+    return /\.(png|jpe?g|gif|webp|avif|bmp)$/i.test(name ?? '');
+  }
+
+  async function resolveImageSrc(info) {
+    if (imageSrcs[info.id]) return;
+
+    if (sentFiles[info.id]) {
+      imageSrcs = { ...imageSrcs, [info.id]: convertFileSrc(sentFiles[info.id]) };
+      return;
+    }
+
+    try {
+      const path = await invoke('get_local_image_path', { transferId: info.id, name: info.name });
+      imageSrcs = { ...imageSrcs, [info.id]: convertFileSrc(path) };
+    } catch {
+    }
   }
 
   function messageByKey(key) {
@@ -175,6 +215,7 @@
     const body = displayBody(msg);
     if (extractGifUrl(body)) return 'Sent a GIF';
     if (extractImageUrl(body)) return 'Sent an image';
+    if (extractImageInfo(body)) return 'Sent an image';
     const fileInfo = extractFileInfo(body);
     if (fileInfo) return `Sent a file: ${fileInfo.name}`;
     const replyParent = replyParentOf(body);
@@ -383,6 +424,15 @@ $effect(() => {
    scrollToBottom('auto');
  });
 
+$effect(() => {
+ for (const msg of visibleMessages) {
+   const info = extractImageInfo(displayBody(msg));
+   if (info && !imageSrcs[info.id] && (sentFiles[info.id] || receivedFiles[info.id])) {
+     resolveImageSrc(info);
+   }
+ }
+});
+
   function escapeRegExp(str) {
     return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
@@ -420,7 +470,7 @@ $effect(() => {
       const picked = await openFileDialog({ multiple: false, title: 'Share a file' });
       if (!picked) return;
       const uid = crypto.randomUUID();
-      const info = await invoke('send_file', { path: picked, uid });
+      const info = await invoke('send_file', { path: picked, uid, room:activeRoom });
       sentFiles = { ...sentFiles, [uid]: picked };
       messages = [...messages, { uid, sender: userNickname, room: activeRoom, body: `${FILE_MARKER}${JSON.stringify(info)}` }];
     } catch (err) {
@@ -902,7 +952,10 @@ $effect(() => {
 
   function previewOf(msg) {
     const body = displayBody(msg);
-    return extractGifUrl(body) ? 'a GIF' : body;
+      if (extractGifUrl(body)) return 'a GIF';
+      if (extractImageInfo(body)) return 'an image';
+      if (extractImageUrl(body)) return 'an image';
+      return body;
   }
 
   function openFullReactionPicker(msg) {
@@ -1000,6 +1053,24 @@ $effect(() => {
 
   onMount(() => {
     let unlisteners = [];
+
+    let unlistenDrag = null;
+
+    async function setupDragDrop() {
+      const webview = getCurrentWebview();
+      unlistenDrag = await webview.onDragDropEvent((event) => {
+        if (event.payload.type === 'drop') {
+          for (const path of event.payload.paths) {
+            shareLocalPathAsFile(path);
+          }
+        }
+      });
+    }
+
+    setupDragDrop()
+
+    const pasteListener = (e) => handlePaste(e);
+    window.addEventListener('paste', pasteListener);
 
     const safe = async (label, fn) => {
       try {
@@ -1102,6 +1173,17 @@ $effect(() => {
         const next = { ...fileProgress };
         delete next[p.id];
         fileProgress = next;
+        // Clear any cached "not found" so the image resolves
+        if (imageSrcs[p.id] === undefined) {
+          const msg = messages.find((m) => {
+            const info = extractImageInfo(displayBody(m));
+            return info?.id === p.id;
+          });
+          if (msg) {
+            const info = extractImageInfo(displayBody(msg));
+            resolveImageSrc(info);
+          }
+        }
       });
 
       await addListener('chat-msg', (event) => {
@@ -1131,6 +1213,8 @@ $effect(() => {
 
     return () => {
       unlisteners.forEach(fn => fn?.());
+      window.removeEventListener('paste', pasteListener);
+      unlistenDrag?.();
     };
   });
 
@@ -1190,6 +1274,44 @@ $effect(() => {
     targetFriendId = '';
   }
 
+  function handlePaste(e) {
+    const items = e.clipboardData?.items;
+    if (items) {
+      for (const item of items) {
+        if (item.type.startsWith('image/')) {
+          e.preventDefault();
+          const file = item.getAsFile();
+          if (file) shareBlobAsFile(file);
+          return;
+        }
+      }
+    }
+    // Some desktops deliver clipboard images as file paths
+    const text = e.clipboardData?.getData?.('text/plain') ?? '';
+    if (text && (text.startsWith('file://') || text.startsWith('/'))) {
+      const path = text.startsWith('file://') ? decodeURIComponent(text.slice(7)) : text;
+      e.preventDefault();
+      shareLocalPathAsFile(path);
+      return;
+    }
+  }
+
+  async function shareLocalPathAsFile(path) {
+    const uid = crypto.randomUUID();
+    try {
+      const info = await invoke('send_file', { path, uid, room: activeRoom });
+      sentFiles = { ...sentFiles, [uid]: path };
+
+      const marker = isImageFile(info.name) ? IMAGE_MARKER : FILE_MARKER;
+      messages = [...messages, {
+        uid,
+        sender: userNickname,
+        room: activeRoom,
+        body: `${marker}${JSON.stringify(info)}`
+      }];
+    } catch (err) { }
+  }
+
   function selectCircuitAddr(e) {
     e.target.select();
   }
@@ -1199,6 +1321,37 @@ $effect(() => {
     if (!parentKey) return { parentKey: null, text: body };
     const rest = body.slice(body.indexOf('\n') + 1);
     return { parentKey, text: rest };
+  }
+
+  async function shareBlobAsFile(file) {
+    if (!file) return;
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const ext = (file.name?.split('.').pop() ?? 'png').toLowerCase();
+      const uid = crypto.randomUUID();
+
+      const path = await invoke('save_temp_media', { data: Array.from(bytes), ext });
+      const info = await invoke('send_file', { path, uid, room: activeRoom });
+      sentFiles = { ...sentFiles, [uid]: path };
+      messages = [...messages, {
+        uid,
+        sender: userNickname,
+        room: activeRoom,
+        body: `${FILE_MARKER}${JSON.stringify(info)}`
+      }];
+    } catch (err) {
+      console.error('[portsidepeer] paste share failed:', err);
+      alert(`Share failed: ${err}`);
+    }
+  }
+
+  async function handleDrop(e) {
+    console.log('[drop-debug] drop fired, files:', e.dataTransfer?.files?.length);
+    e.preventDefault();
+    const files = Array.from(e.dataTransfer?.files ?? []);
+    for (const file of files) {
+      await shareBlobAsFile(file);
+    }
   }
 
 </script>
@@ -1392,8 +1545,15 @@ $effect(() => {
     </header>
 
     <div class="chat-container">
-      <div class="message-log" bind:this={messageLogEl} onscroll={handleMessageLogScroll}>
-        <div class="message-log-inner" bind:this={messageLogInnerEl}>
+      <div class="message-log"
+          role="log"
+          aria-label="Chat messages. Drop files here to share them"
+          bind:this={messageLogEl}
+          onscroll={handleMessageLogScroll}
+          ondragover={(e) => e.preventDefault()}
+          ondrop={handleDrop}
+      >
+     <div class="message-log-inner" bind:this={messageLogInnerEl}>
             {#if visibleMessages.length === 0}
               <div class="welcome-card">
                 <h1>Welcome to #{activeRoomName()}!</h1>
@@ -1408,6 +1568,7 @@ $effect(() => {
             {@const isMine = senderName(msg) === userNickname}
             {@const mKey = messageKey(msg)}
             {@const replyInfo = displayReply(body)}
+            {@const imageInfo = extractImageInfo(body)}
             <div class="message-card" id={`msg-${mKey}`}>
               <div class="avatar-mock">{senderInitials(msg)}</div>
               <div class="message-content">
@@ -1443,6 +1604,38 @@ $effect(() => {
                             />
                         </div>
                         {/if}
+                        {:else if imageInfo}                                          <!-- ← NEW BRANCH STARTS HERE -->
+                            {@const src = imageSrcs[imageInfo.id]}
+                            {#if src}
+                                <div class="gif-media-frame">
+                                    <img
+                                        src={src}
+                                        alt={`Image from ${senderName(msg)}`}
+                                        onerror={() => handleMediaError(src)}
+                                    />
+                                </div>
+                            {:else if fileProgress[imageInfo.id]}
+                                <div class="file-card">
+                                    <span class="file-icon">🖼️</span>
+                                    <div class="file-details">
+                                        <span class="file-name" title={imageInfo.name}>{imageInfo.name}</span>
+                                        <span class="file-size">
+                                            {Math.round((fileProgress[imageInfo.id].received / Math.max(fileProgress[imageInfo.id].total, 1)) * 100)}%
+                                        </span>
+                                    </div>
+                                </div>
+                            {:else if sentFiles[imageInfo.id] || receivedFiles[imageInfo.id]}
+                                <span class="file-progress-label">Loading image…</span>
+                            {:else}
+                                <div class="file-card">
+                                    <span class="file-icon">🖼️</span>
+                                    <div class="file-details">
+                                        <span class="file-name" title={imageInfo.name}>{imageInfo.name}</span>
+                                        <span class="file-size">{imageInfo.size ? formatBytes(imageInfo.size) : ''}</span>
+                                    </div>
+                                    <span class="file-progress-label">Not downloaded</span>
+                                </div>
+                            {/if}
                   {:else if fileInfo}
                     <div class="file-card">
                       <span class="file-icon">📄</span>
@@ -1732,19 +1925,10 @@ $effect(() => {
 
 <style>
 
- body, html {
-  margin: 0 !important;
-  padding: 0 !important;
-  background-color: #090d16;
-  width: 100vw;
-  height: 100vh;
-  overflow: hidden;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
- }
   .app-layout {
     display: flex;
-    width: 100vw;
-    height: 100vh;
+    width: 100%;
+    height: 100%;
     background: #090d16;
     color: #e2e8f0;
     overflow: hidden;
@@ -2047,6 +2231,7 @@ $effect(() => {
     display: flex;
     flex-direction: column;
     flex-grow: 1;
+    min-height: 0;
     height: 100%;
     overflow: hidden;
     background: #090d16;
@@ -2089,19 +2274,20 @@ $effect(() => {
   }
 
   .chat-container {
-    padding: 20px 20px 0;
     display: flex;
     flex-direction: column;
     flex-grow: 1;
     padding: 20px;
     overflow: hidden;
     box-sizing: border-box;
+    min-height: 0;
   }
 
   .message-log {
     flex-grow: 1;
     overflow-y: auto;
     padding-bottom: 20px;
+    min-height: 0
   }
 
   .message-log-inner {
@@ -2795,7 +2981,6 @@ $effect(() => {
 
   .room-rename-form { display: flex; gap: 6px; align-items: center; }
 
-  .rename-hint { opacity: 0; font-size: 11px; transition: opacity 0.15s ease; }
   .room-title-btn {
     display: inline-flex;
     align-items: center;
@@ -2862,6 +3047,8 @@ $effect(() => {
   .reply-quote-sender { color: #10b981; font-weight: 600; flex-shrink: 0; }
 
   .reply-quote-text {
+    min-width: 0;
+    flex: 1 1 auto;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
