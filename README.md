@@ -9,7 +9,8 @@ Decentralized peer to peer chat app built for the user and not for data centers.
 - Automatically discover other PortsidePeer clients on the local network.
 - All messages are encrypted by default with the NOISE protocol.
 - Allow list based friend lists.
-- Send gifs and paste gif urls. 
+- Send gifs and paste gif urls.
+- Copy/paste images or image urls
 - React to messages with emojis, emoji search, etc.
 - Send Files to everyone in the chatroom.
 - Message history stored locally.

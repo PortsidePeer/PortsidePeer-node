@@ -47,6 +47,7 @@ pub struct WireMessage {
     pub uid: Option<String>,
     pub timestamp: Option<String>,
     pub room: Option<String>,
+    pub sender_pid: Option<String>,
     pub sender: String,
     pub body: String,
 }
@@ -139,6 +140,7 @@ pub struct ChatMessage {
     pub id: Option<i32>,
     pub uid: Option<String>,
     pub sender: String,
+    pub sender_pid: Option<String>,
     pub room: String,
     pub body: String,
     pub timestamp: String,
@@ -327,6 +329,7 @@ pub fn init_database(app_handle: &tauri::AppHandle) -> Connection {
     .expect("Failed to initialize database tables");
 
     let _ = conn.execute("ALTER TABLE messages ADD COLUMN uid TEXT", []);
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN sender_pid TEXT", []);
 
     conn
 }
@@ -340,7 +343,7 @@ fn get_profile(state: tauri::State<'_, AppState>) -> UserProfile {
 fn get_chat_history(state: tauri::State<'_, AppState>) -> Result<Vec<ChatMessage>, String> {
     let db = state.db.lock().unwrap();
     let mut stmt = db
-        .prepare("SELECT id, uid, sender, room, body, timestamp FROM messages ORDER BY id ASC")
+        .prepare("SELECT id, uid, sender, sender_pid, room, body, timestamp FROM messages ORDER BY id ASC")
         .map_err(|e| e.to_string())?;
 
     let rows = stmt
@@ -349,9 +352,10 @@ fn get_chat_history(state: tauri::State<'_, AppState>) -> Result<Vec<ChatMessage
                 id: Some(row.get(0)?),
                 uid: row.get(1)?,
                 sender: row.get(2)?,
-                room: row.get(3)?,
-                body: row.get(4)?,
-                timestamp: row.get(5)?,
+                sender_pid: row.get(3)?,
+                room: row.get(4)?,
+                body: row.get(5)?,
+                timestamp: row.get(6)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -1169,12 +1173,13 @@ pub fn start_p2p_backend(
                                     if let Some(app_state) = app_handle_clone.try_state::<AppState>() {
                                         let current_allow_list = app_state.allow_list.lock().unwrap().clone();
                                         let nickname = profile_clone.lock().unwrap().nickname.clone();
+                                        let peer_id = profile_clone.lock().unwrap().peer_id.clone();
                                         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
                                         if let Ok(db) = app_state.db.lock() {
                                             let _ = db.execute(
-                                                "INSERT INTO messages (uid, sender, room, body, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
-                                                rusqlite::params![uid.as_str(), nickname.as_str(), "sbb-lounge", body.as_str(), now.as_str()],
+                                                "INSERT INTO messages (uid, sender, sender_pid, room, body, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                                                rusqlite::params![uid.as_str(), nickname.as_str(), peer_id.as_str(), room.as_str(), body.as_str(), now.as_str()],
                                             );
                                         }
                                         for friend_pid_str in &current_allow_list {
@@ -1207,12 +1212,15 @@ pub fn start_p2p_backend(
                                                     }
                                                 }
 
+                                                let peer_id = profile_clone.lock().unwrap().peer_id.clone();
+
                                                 swarm.behaviour_mut().request_response.send_request(
                                                     &friend_peer_id,
                                                     WireMessage {
                                                         uid: Some(uid.clone()),
                                                         timestamp: Some(now.clone()),
                                                         room: Some(room.clone()),
+                                                        sender_pid: Some(peer_id.clone()),
                                                         sender: nickname.clone(),
                                                         body: body.clone(),
                                                     },
@@ -1341,10 +1349,11 @@ pub fn start_p2p_backend(
                                             if let Some(app_state) = app_handle_clone.try_state::<AppState>() {
                                                 if let Ok(db) = app_state.db.lock() {
                                                     let _ = db.execute(
-                                                        "INSERT INTO messages (uid, sender, channel, body, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
+                                                        "INSERT INTO messages (uid, sender, room, body, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
                                                         rusqlite::params![
                                                             request.uid.as_deref(),
                                                             request.sender.as_str(),
+                                                            request.sender_pid.as_deref(),
                                                             chat_room.as_str(),
                                                             request.body.as_str(),
                                                             timestamp.as_str()
@@ -1357,6 +1366,7 @@ pub fn start_p2p_backend(
                                                 id: None,
                                                 uid: request.uid,
                                                 sender: request.sender,
+                                                sender_pid: request.sender_pid.clone(),
                                                 room: chat_room,
                                                 body: request.body,
                                                 timestamp,

@@ -1,4 +1,4 @@
-<script>
+<script lang="ts">
 
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
@@ -13,7 +13,18 @@
     sendNotification
   } from '@tauri-apps/plugin-notification';
 
-  let messages = $state([]);
+  type ChatMessage = {
+      uid?: string;
+      room?: string;
+      sender: string;
+      sender_pid?: string;
+      channel?: string;
+      body: string;
+      timestamp?: string;
+      id?: number;
+  };
+
+  let messages = $state([] as string[]);
   let inputMessage = $state('');
   let userNickname = $state('Loading...');
   let userPeerId = $state('');
@@ -67,7 +78,7 @@
 
   let messageLogEl = $state(null);
   let messageLogInnerEl = $state(null);
-  let composerInputEl;
+  let composerInputEl: HTMLInputElement;
   let initialJumpDone = false;
   let lastAutoScrollAt = 0;
   let pinnedToBottom = true;
@@ -84,11 +95,17 @@
 
   const ROOM_MARKER = 'P2P_ROOM:';
 
-  let replyTo = $state(null);
+  type ReplyTarget = {
+    key: string;
+    name: string;
+    preview: string;
+  };
+
+  let replyTo = $state<ReplyTarget | null>(null);
 
   const REPLY_MARKER = 'P2P_REPLY:';
 
-  function replyPreviewOf(msg) {
+  function replyPreviewOf(msg: ChatMessage): string {
     const body = displayBody(msg);
       if (extractGifUrl(body)) return 'a GIF';
       if (extractImageUrl(body)) return 'an image';
@@ -101,7 +118,7 @@
     return body.slice(0, 80);
   }
 
-  function startReply(msg) {
+  function startReply(msg: ChatMessage) {
     replyTo = {
       key: messageKey(msg),
       name: senderName(msg),
@@ -119,7 +136,7 @@
 
   let imageSrcs = $state({});
 
-  function extractImageInfo(body) {
+  function extractImageInfo(body: string) {
     if (typeof body !== 'string' || !body.startsWith(IMAGE_MARKER)) return null;
     try {
       const info = JSON.parse(body.slice(IMAGE_MARKER.length));
@@ -128,7 +145,7 @@
     return null;
   }
 
-  function isImageFile(name) {
+  function isImageFile(name: string) {
     return /\.(png|jpe?g|gif|webp|avif|bmp)$/i.test(name ?? '');
   }
 
@@ -147,7 +164,7 @@
     }
   }
 
-  function messageByKey(key) {
+  function messageByKey(key: string): ChatMessage | null {
     if (typeof key !== 'string') return null;
     if (key.startsWith('uid:')) {
       const uid = key.slice(4);
@@ -229,7 +246,7 @@
   function shouldNotify(msg) {
     if (!notificationsGranted || !notificationsEnabled) return false;
     if (senderName(msg) === userNickname) return false;
-    if (reactionPayloadOf(msg) || roomEventPayloadOf(msg)) return false;
+    if (reactionPayloadOf(msg) || roomEventPayloadOf(msg) || avatarPayloadOf(msg)) return false;
     if (mutedRooms[roomOf(msg)]) return false;
     return !roomIsVisible(roomOf(msg));
   }
@@ -305,6 +322,80 @@
       if (typeof payload?.id === 'string' && typeof payload?.name === 'string' && (payload.a === 'create' || payload.a === 'rename')) return payload;
     } catch { }
     return null;
+  }
+
+  const AVATAR_MARKER = 'P2P_AVATAR:';
+  const AVATAR_MAX_BYTES = 32 * 1024;
+  let avatars = $state({});
+
+  async function pickAvatar() {
+    try {
+      const picked = await openFileDialog({
+        multiple: false,
+        title: 'Choose an avatar',
+        filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp'] }]
+      });
+      if (!picked) return;
+
+      const dataUrl = await resizeToAvatar(picked);
+      if (!dataUrl) { alert('Image too large even after resizing — try a smaller one'); return; }
+
+      await invoke('send_chat_message', {
+        message: `${AVATAR_MARKER}${JSON.stringify({ p: userPeerId, n: userNickname, d: dataUrl.split(',')[1] })}`,
+        uid: crypto.randomUUID(),
+        room: activeRoom
+      });
+
+      avatars = { ...avatars, [userPeerId]: dataUrl };
+    } catch (err) {
+      alert(`Avatar failed: ${err}`);
+    }
+  }
+
+  async function resizeToAvatar(path) {
+
+    const src = convertFileSrc(path);
+    const img = await new Promise((res, rej) => {
+      const i = new Image();
+      i.crossOrigin = 'anonymous';
+      i.onload = () => res(i);
+      i.onerror = rej;
+      i.src = src;
+    });
+    const canvas = document.createElement('canvas');
+    canvas.width = 256; canvas.height = 256;
+    const ctx = canvas.getContext('2d');
+
+    const side = Math.min(img.width, img.height);
+    ctx.drawImage(img, (img.width - side) / 2, (img.height - side) / 2, side, side, 0, 0, 256, 256);
+
+    for (const q of [0.85, 0.7, 0.5, 0.35]) {
+      const url = canvas.toDataURL('image/jpeg', q);
+      if (url.length < AVATAR_MAX_BYTES) return url;
+    }
+    return null;
+  }
+
+  function avatarPayloadOf(msg) {
+    const body = displayBody(msg);
+    if (typeof body !== 'string' || !body.startsWith(AVATAR_MARKER)) return null;
+    try {
+      const payload = JSON.parse(body.slice(AVATAR_MARKER.length));
+      if (typeof payload?.p === 'string' && typeof payload?.d === 'string') return payload;
+    } catch {}
+    return null;
+  }
+
+  function applyAvatarEvent(msg: ChatMessage) {
+    const payload = avatarPayloadOf(msg);
+    if (!payload) return;
+    if (msg.sender_pid && payload.p !== msg.sender_pid) return;
+    avatars = { ...avatars, [payload.p]: `data:image/jpeg;base64,${payload.d}` };
+  }
+
+  function avatarFor(msg: ChatMessage): string | null {
+    const pid = msg.sender_pid ?? `nick:${senderName(msg)}`;
+    return avatars[pid] ?? null;
   }
 
   async function applyRoomEvent(msg) {
@@ -472,7 +563,7 @@ $effect(() => {
       const uid = crypto.randomUUID();
       const info = await invoke('send_file', { path: picked, uid, room:activeRoom });
       sentFiles = { ...sentFiles, [uid]: picked };
-      messages = [...messages, { uid, sender: userNickname, room: activeRoom, body: `${FILE_MARKER}${JSON.stringify(info)}` }];
+      messages = [...messages, { uid, sender_pid: userPeerId, room: activeRoom, sender: userNickname, body: `${FILE_MARKER}${JSON.stringify(info)}` }];
     } catch (err) {
       alert(`File share failed: ${err}`);
     }
@@ -655,7 +746,7 @@ $effect(() => {
     if (!gifUrl) return;
     const uid = crypto.randomUUID();
     const specializedGifPayload = `P2P_MEDIA_GIF:${gifUrl}`;
-    messages = [...messages, { uid, sender: userNickname, room: activeRoom, body: specializedGifPayload }];
+    messages = [...messages, { uid, sender_pid: userPeerId, room: activeRoom, sender: userNickname, body: specializedGifPayload }];
     await invoke('send_chat_message', { message: specializedGifPayload, uid, room: activeRoom });
     showGifPanel = false;
     gifSearchQuery = '';
@@ -1128,6 +1219,7 @@ $effect(() => {
         if (!m || typeof m !== 'object') continue;
         if (reactionPayloadOf(m)) { applyReactionEvent(m); continue; }
         if (roomEventPayloadOf(m)) { applyRoomEvent(m); continue; }
+        if (avatarPayloadOf(m)) { applyAvatarEvent(m); continue; }
         chatOnly.push(m);
       }
       messages = chatOnly;
@@ -1173,7 +1265,7 @@ $effect(() => {
         const next = { ...fileProgress };
         delete next[p.id];
         fileProgress = next;
-        // Clear any cached "not found" so the image resolves
+
         if (imageSrcs[p.id] === undefined) {
           const msg = messages.find((m) => {
             const info = extractImageInfo(displayBody(m));
@@ -1193,6 +1285,7 @@ $effect(() => {
           notifyNewMessage(incoming);
           if (reactionPayloadOf(incoming)) { applyReactionEvent(incoming); return; }
           if (roomEventPayloadOf(incoming)) { applyRoomEvent(incoming); return; }
+          if (avatarPayloadOf(incoming)) { applyAvatarEvent(incoming); return; }
           messages = [...messages, incoming];
         }
       });
@@ -1228,7 +1321,7 @@ $effect(() => {
         ? `${REPLY_MARKER}${JSON.stringify({ t: replyTo.key })}\n${rawBody}`
         : rawBody;
 
-    messages = [...messages, { uid, room: activeRoom, sender: userNickname, body: outgoingBody }];
+    messages = [...messages, { uid, sender_pid: userPeerId, room: activeRoom, sender: userNickname, body: outgoingBody }];
     await invoke('send_chat_message', { message: outgoingBody, uid, room: activeRoom });
 
     inputMessage = '';
@@ -1303,12 +1396,8 @@ $effect(() => {
       sentFiles = { ...sentFiles, [uid]: path };
 
       const marker = isImageFile(info.name) ? IMAGE_MARKER : FILE_MARKER;
-      messages = [...messages, {
-        uid,
-        sender: userNickname,
-        room: activeRoom,
-        body: `${marker}${JSON.stringify(info)}`
-      }];
+      messages = [...messages, { uid, sender_pid: userPeerId, room: activeRoom, sender: userNickname, body: `${marker}${JSON.stringify(info)}` }];
+
     } catch (err) { }
   }
 
@@ -1333,12 +1422,7 @@ $effect(() => {
       const path = await invoke('save_temp_media', { data: Array.from(bytes), ext });
       const info = await invoke('send_file', { path, uid, room: activeRoom });
       sentFiles = { ...sentFiles, [uid]: path };
-      messages = [...messages, {
-        uid,
-        sender: userNickname,
-        room: activeRoom,
-        body: `${FILE_MARKER}${JSON.stringify(info)}`
-      }];
+      messages = [...messages, { uid, sender_pid: userPeerId, room: activeRoom, sender: userNickname, body: `${FILE_MARKER}${JSON.stringify(info)}` }];
     } catch (err) {
       console.error('[portsidepeer] paste share failed:', err);
       alert(`Share failed: ${err}`);
@@ -1505,8 +1589,13 @@ $effect(() => {
     <div class="profile-drawer">
       {#if !editMode}
         <div class="profile-view">
-          <span class="profile-name" title={userPeerId}>🌐 {userNickname}</span>
-          <button onclick={() => editMode = true} class="edit-btn">Edit</button>
+            {#if avatars[userPeerId]}
+                <img class="avatar-img" src={avatars[userPeerId]} alt="" />
+            {:else}
+            <span class="profile-name" title={userPeerId}>🌐 {userNickname}</span>
+            {/if}
+           <button onclick={pickAvatar} class="edit-btn">Avatar</button>
+           <button onclick={() => editMode = true} class="edit-btn">Edit</button>
         </div>
       {:else}
         <form onsubmit={saveNickname} class="profile-edit">
@@ -1570,7 +1659,11 @@ $effect(() => {
             {@const replyInfo = displayReply(body)}
             {@const imageInfo = extractImageInfo(body)}
             <div class="message-card" id={`msg-${mKey}`}>
-              <div class="avatar-mock">{senderInitials(msg)}</div>
+                {#if avatarFor(msg)}
+                    <img class="avatar-img" src={avatarFor(msg)} alt="" />
+                {:else}
+                    <div class="avatar-mock">{senderInitials(msg)}</div>
+                {/if}
               <div class="message-content">
                 <span class="user-badge" class:self-user={isMine}>{senderName(msg)}</span>
 
@@ -1604,7 +1697,7 @@ $effect(() => {
                             />
                         </div>
                         {/if}
-                        {:else if imageInfo}                                          <!-- ← NEW BRANCH STARTS HERE -->
+                        {:else if imageInfo}
                             {@const src = imageSrcs[imageInfo.id]}
                             {#if src}
                                 <div class="gif-media-frame">
@@ -2324,17 +2417,17 @@ $effect(() => {
   }
 
   .avatar-mock {
-    width: 40px;
-    height: 40px;
+    width: 52px;
+    height: 52px;
+    border-radius: 50%;
     background: #1f232b;
     border: 1px solid #334155;
-    border-radius: 4px;
     display: flex;
     align-items: center;
     justify-content: center;
     color: #10b981;
     font-weight: bold;
-    font-size: 14px;
+    font-size: 16px;
     flex-shrink: 0;
   }
 
@@ -3176,5 +3269,14 @@ $effect(() => {
   .room-row-wrap:hover .room-mute-btn { opacity: 0.6; }
   .room-mute-btn:hover { opacity: 1 !important; background: #1f232b; }
   .room-mute-btn.muted { opacity: 0.8; }
+
+  .avatar-img {
+    width: 52px;
+    height: 52px;
+    border-radius: 50%;
+    object-fit: cover;
+    flex-shrink: 0;
+    background: #1f232b;
+  }
 
   </style>
