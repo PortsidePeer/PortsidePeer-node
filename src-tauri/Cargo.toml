@@ -1,6 +1,6 @@
 [package]
 name = "portsidepeer"
-version = "0.1.7"
+version = "0.1.8"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -24,8 +24,8 @@ tokio = { version = "1.0", features = ["full"] }
 futures = "0.3"
 
 # libp2p configuration:
-libp2p = { version = "0.54", features = ["tokio", "mdns", "kad", "noise", "yamux", "tcp", "dns", "relay", "identify", "dcutr", "request-response", "cbor", "macros"] }
-libp2p-swarm = "0.45"
+libp2p = { version = "0.56", features = ["tokio", "mdns", "kad", "noise", "yamux", "tcp", "dns", "relay", "identify", "dcutr", "request-response", "cbor", "macros"] }
+libp2p-swarm = "0.47"
 
 tauri-plugin-opener = "2.0"
 tauri-plugin-dialog = "2"

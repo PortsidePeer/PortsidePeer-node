@@ -13,6 +13,19 @@
     sendNotification
   } from '@tauri-apps/plugin-notification';
 
+  interface Room { id: string; name: string }
+  interface ReactionActor { p: string; n?: string }
+  interface ReactionPayload { e?: string; t?: string; p?: string; n?: string; a?: 'add' | 'remove' }
+  interface RoomEventPayload { a: 'create' | 'rename'; id: string; name: string }
+  interface ReactTarget { key: string; preview: string }
+  interface KlipyGif {
+    title?: string;
+    file?: { hd?: { gif?: { url?: string } }; sd?: { gif?: { url?: string } } };
+  }
+  interface AvatarPayload { p: string; d: string }
+  interface FileProgressInfo { received: number; total: number }
+
+
   type ChatMessage = {
       uid?: string;
       room?: string;
@@ -23,8 +36,9 @@
       timestamp?: string;
       id?: number;
   };
+  interface FileInfo { id: string; name: string; size?: number }
 
-  let messages = $state([] as string[]);
+  let messages = $state<ChatMessage[]>([]);
   let inputMessage = $state('');
   let userNickname = $state('Loading...');
   let userPeerId = $state('');
@@ -34,16 +48,16 @@
   // Notifications
   let notificationsGranted = $state(false);
   let notificationsEnabled = $state(true);
-  let mutedRooms = $state({});
-  let unreadByRoom = $state({});
+  let mutedRooms = $state<Record<string, boolean>>({});
+  let unreadByRoom = $state<Record<string, number>>({});
 
-  let allowedPeers = $state([]);
+  let allowedPeers = $state<string[]>([]);
   let targetFriendId = $state('');
-  let discoveredPeers = $state([]);
+  let discoveredPeers = $state<string[]>([]);
 
   let showGifPanel = $state(false);
   let gifSearchQuery = $state('');
-  let searchResults = $state([]);
+  let searchResults = $state<KlipyGif[]>([]);
   let isSearchingGifs = $state(false);
 
   let showEmojiPicker = $state(false);
@@ -56,28 +70,28 @@
   let myCircuitAddress = $state('');
   let dialAddress = $state('');
   let showRelayPanel = $state(false);
-  let reactions = $state({});
-  let reactionPickerFor = $state(null);
+  let reactions = $state<Record<string, Record<string, ReactionActor[]>>>({});
+  let reactionPickerFor = $state<string | null>(null);
   let reactionPickerFlip = $state(false);
-  let recentEmoji = $state([]);
+  let recentEmoji  = $state<string[]>([]);
 
   const RECENT_EMOJI_KEY = 'portsidepeer-recent-emoji';
   const RECENT_EMOJI_MAX = 16;
 
   let emojiMode = $state('compose');
-  let reactTarget = $state(null);
+  let reactTarget = $state<ReactTarget | null>(null);
   let emojiSearchQuery = $state('');
 
-  let sentFiles = $state({});
-  let receivedFiles = $state({});
-  let fileProgress = $state({});
+  let sentFiles = $state<Record<string, string>>({});
+  let receivedFiles = $state<Record<string, string>>({});
+  let fileProgress = $state<Record<string, FileProgressInfo>>({});
 
   let klipyApiKey = $state('');
   let klipyKeyInput = $state('');
   let klipySaved = $state(false);
 
-  let messageLogEl = $state(null);
-  let messageLogInnerEl = $state(null);
+  let messageLogEl = $state<HTMLDivElement | null>(null);
+  let messageLogInnerEl = $state<HTMLDivElement | null>(null);
   let composerInputEl: HTMLInputElement;
   let initialJumpDone = false;
   let lastAutoScrollAt = 0;
@@ -86,7 +100,7 @@
   const NEAR_BOTTOM_PX = 200;
 
   // Rooms
-  let rooms = $state([]);
+  let rooms = $state<Room[]>([]);
   let activeRoom = $state('sbb-lounge');
   let roomNameInput = $state('');
   let editingRoom = $state(false);
@@ -134,7 +148,7 @@
 
   const IMAGE_MARKER = 'P2P_MEDIA_IMAGE:';
 
-  let imageSrcs = $state({});
+  let imageSrcs = $state<Record<string, string>>({});
 
   function extractImageInfo(body: string) {
     if (typeof body !== 'string' || !body.startsWith(IMAGE_MARKER)) return null;
@@ -149,7 +163,7 @@
     return /\.(png|jpe?g|gif|webp|avif|bmp)$/i.test(name ?? '');
   }
 
-  async function resolveImageSrc(info) {
+  async function resolveImageSrc(info: FileInfo) {
     if (imageSrcs[info.id]) return;
 
     if (sentFiles[info.id]) {
@@ -158,7 +172,7 @@
     }
 
     try {
-      const path = await invoke('get_local_image_path', { transferId: info.id, name: info.name });
+      const path = await invoke<string>('get_local_image_path', { transferId: info.id, name: info.name });
       imageSrcs = { ...imageSrcs, [info.id]: convertFileSrc(path) };
     } catch {
     }
@@ -207,12 +221,12 @@
     saveNotificationPrefs();
   }
 
-  function toggleRoomMute(roomId) {
+  function toggleRoomMute(roomId: string) {
     mutedRooms = { ...mutedRooms, [roomId]: !mutedRooms[roomId] };
     saveNotificationPrefs();
   }
 
-  function switchRoom(id) {
+  function switchRoom(id: string) {
     activeRoom = id;
     scrollToBottom('auto');
     if (unreadByRoom[id]) {
@@ -220,15 +234,15 @@
     }
   }
 
-  function roomIsVisible(room) {
+  function roomIsVisible(room: string): boolean {
     return room === activeRoom && document.hasFocus();
   }
 
-  function activeRoomNameFor(id) {
+  function activeRoomNameFor(id: string): string {
     return rooms.find((c) => c.id === id)?.name ?? id;
   }
 
-  function previewFor(msg) {
+  function previewFor(msg: ChatMessage): string {
     const body = displayBody(msg);
     if (extractGifUrl(body)) return 'Sent a GIF';
     if (extractImageUrl(body)) return 'Sent an image';
@@ -243,7 +257,7 @@
     return body.slice(0, 80) || 'Sent a message';
   }
 
-  function shouldNotify(msg) {
+  function shouldNotify(msg: ChatMessage): boolean {
     if (!notificationsGranted || !notificationsEnabled) return false;
     if (senderName(msg) === userNickname) return false;
     if (reactionPayloadOf(msg) || roomEventPayloadOf(msg) || avatarPayloadOf(msg)) return false;
@@ -266,12 +280,12 @@
     } catch { }
   }
 
-  function pushRecentEmoji(emoji) {
+  function pushRecentEmoji(emoji: string) {
     recentEmoji = [emoji, ...recentEmoji.filter((e) => e !== emoji)].slice(0, RECENT_EMOJI_MAX);
     saveRecentEmoji();
   }
 
-  function notifyNewMessage(msg) {
+  function notifyNewMessage(msg: ChatMessage) {
     const room = roomOf(msg);
 
     if (senderName(msg) !== userNickname && !roomIsVisible(room)) {
@@ -283,14 +297,14 @@
     try {
       sendNotification({
         title: `${senderName(msg)} • #${activeRoomNameFor(room)}`,
-        body: previewFor(msg)
+        body: previewFor(msg),
       });
     } catch (err) {
       console.error('[portsidepeer] notify failed', err);
     }
   }
 
-  function replyParentOf(body) {
+  function replyParentOf(body: string): string | null {
     if (typeof body !== 'string' || !body.startsWith(REPLY_MARKER)) return null;
     const newline = body.indexOf('\n');
     const jsonPart = newline === -1 ? body.slice(REPLY_MARKER.length) : body.slice(REPLY_MARKER.length, newline);
@@ -301,12 +315,12 @@
     return null;
   }
 
-  function slugify(name) {
+  function slugify(name: string): string {
     const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
     return slug || 'room';
   }
 
-  function roomOf(msg) {
+  function roomOf(msg: ChatMessage): string {
     return typeof msg?.room === 'string' && msg.room ? msg.room : 'sbb-lounge';
   }
 
@@ -314,7 +328,7 @@
     return rooms.find((c) => c.id === activeRoom)?.name ?? activeRoom;
   }
 
-  function roomEventPayloadOf(msg) {
+  function roomEventPayloadOf(msg: ChatMessage): RoomEventPayload | null {
     const body = displayBody(msg);
     if (typeof body !== 'string' || !body.startsWith(ROOM_MARKER)) return null;
     try {
@@ -326,7 +340,7 @@
 
   const AVATAR_MARKER = 'P2P_AVATAR:';
   const AVATAR_MAX_BYTES = 32 * 1024;
-  let avatars = $state({});
+  let avatars = $state<Record<string, string>>({});
 
   async function pickAvatar() {
     try {
@@ -352,10 +366,10 @@
     }
   }
 
-  async function resizeToAvatar(path) {
+  async function resizeToAvatar(path: string) {
 
     const src = convertFileSrc(path);
-    const img = await new Promise((res, rej) => {
+    const img = await new Promise<HTMLImageElement>((res, rej) => {
       const i = new Image();
       i.crossOrigin = 'anonymous';
       i.onload = () => res(i);
@@ -365,6 +379,7 @@
     const canvas = document.createElement('canvas');
     canvas.width = 256; canvas.height = 256;
     const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('canvas 2d context unavailable');
 
     const side = Math.min(img.width, img.height);
     ctx.drawImage(img, (img.width - side) / 2, (img.height - side) / 2, side, side, 0, 0, 256, 256);
@@ -376,7 +391,7 @@
     return null;
   }
 
-  function avatarPayloadOf(msg) {
+  function avatarPayloadOf(msg: ChatMessage): AvatarPayload | null {
     const body = displayBody(msg);
     if (typeof body !== 'string' || !body.startsWith(AVATAR_MARKER)) return null;
     try {
@@ -398,12 +413,12 @@
     return avatars[pid] ?? null;
   }
 
-  async function applyRoomEvent(msg) {
+  async function applyRoomEvent(msg: ChatMessage) {
     const payload = roomEventPayloadOf(msg);
     if (!payload) return;
     if (payload.a === 'create' && !rooms.some((c) => c.id === payload.id)) {
       try {
-        const info = await invoke('create_room', { id: payload.id, name: payload.name });
+        const info = await invoke<Room>('create_room', { id: payload.id, name: payload.name });
         rooms = [...rooms, info];
       } catch {
         rooms = [...rooms.filter((c) => c.id !== payload.id), { id: payload.id, name: payload.name }];
@@ -418,14 +433,14 @@
     }
   }
 
-  async function createRoom(e) {
+  async function createRoom(e: SubmitEvent) {
     e.preventDefault();
     const name = newRoomInput.trim();
     if (!name) return;
     let id = slugify(name);
     if (rooms.some((c) => c.id === id)) id = `${id}-${Math.random().toString(36).slice(2, 6)}`;
     try {
-      const info = await invoke('create_room', { id, name });
+      const info = await invoke<Room>('create_room', { id, name });
       rooms = [...rooms, info];
       await invoke('send_chat_message', {
         message: `${ROOM_MARKER}${JSON.stringify({ a: 'create', id, name })}`,
@@ -440,7 +455,7 @@
     }
   }
 
-  async function renameRoom(e) {
+  async function renameRoom(e: SubmitEvent) {
     e.preventDefault();
     const name = roomNameInput.trim();
     if (!name) return;
@@ -471,7 +486,7 @@
     );
   }
 
-  function scrollToBottom(behavior = 'auto') {
+  function scrollToBottom(behavior: ScrollBehavior = 'auto') {
     if (!messageLogEl) return;
     lastAutoScrollAt = Date.now();
     messageLogEl.scrollTo({ top: messageLogEl.scrollHeight, behavior });
@@ -524,11 +539,11 @@ $effect(() => {
  }
 });
 
-  function escapeRegExp(str) {
+  function escapeRegExp(str: string): string {
     return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
-  function displayBody(msg) {
+  function displayBody(msg: ChatMessage): string {
     const raw = typeof msg?.body === 'string' ? msg.body : '';
     const sender = typeof msg?.sender === 'string' ? msg.sender.trim() : '';
     if (sender) {
@@ -540,7 +555,7 @@ $effect(() => {
 
   const FILE_MARKER = 'P2P_MEDIA_FILE:';
 
-  function extractFileInfo(body) {
+  function extractFileInfo(body: string): FileInfo | null {
     if (typeof body !== 'string' || !body.startsWith(FILE_MARKER)) return null;
     try {
       const info = JSON.parse(body.slice(FILE_MARKER.length));
@@ -549,7 +564,8 @@ $effect(() => {
     return null;
   }
 
-  function formatBytes(n) {
+  function formatBytes(input?: number): string {
+    const n = input ?? 0;
     if (n < 1024) return `${n} B`;
     if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
     if (n < 1073741824) return `${(n / 1048576).toFixed(1)} MB`;
@@ -569,7 +585,7 @@ $effect(() => {
     }
   }
 
-  async function openSharedFile(info) {
+  async function openSharedFile(info: FileInfo) {
     try {
       if (sentFiles[info.id]) {
         await invoke('open_local_file', { path: sentFiles[info.id] });
@@ -583,7 +599,7 @@ $effect(() => {
 
   const GIF_MARKER = 'P2P_MEDIA_GIF:';
 
-  function extractGifUrl(rawBody) {
+  function extractGifUrl(rawBody: string): string | null {
     const body = typeof rawBody === 'string' ? rawBody : '';
     const idx = body.indexOf(GIF_MARKER);
     if (idx === -1) return null;
@@ -592,7 +608,7 @@ $effect(() => {
   }
 
   // Image urls
-  function extractImageUrl(body) {
+  function extractImageUrl(body: string): string | null {
     const text = typeof body === 'string' ? body.trim() : '';
     if (!text || /\s/.test(text)) return null;
     if (!/^https:\/\//i.test(text)) return null;
@@ -604,12 +620,12 @@ $effect(() => {
   const REACT_MARKER = 'P2P_REACT:';
   const QUICK_REACTIONS = ['👍', '❤️', '😂', '😮', '😢', '🎉', '🍻', '💩'];
 
-  function messageKey(msg) {
+  function messageKey(msg: ChatMessage): string {
     if (typeof msg?.uid === 'string' && msg.uid) return `uid:${msg.uid}`;
     return `legacy:${senderName(msg)}::${displayBody(msg)}`;
   }
 
-  function reactionPayloadOf(msg) {
+  function reactionPayloadOf(msg: ChatMessage): ReactionPayload | null {
     const body = displayBody(msg);
     if (typeof body !== 'string' || !body.startsWith(REACT_MARKER)) return null;
     try {
@@ -625,14 +641,14 @@ $effect(() => {
       : { p: `nick:${userNickname}`, n: userNickname };
   }
 
-  function actorOf(payload, fallbackName) {
+  function actorOf(payload: ReactionPayload, fallbackName: string): ReactionActor {
     if (typeof payload?.p === 'string' && payload.p) {
       return { p: payload.p, n: typeof payload.n === 'string' && payload.n ? payload.n : fallbackName };
     }
     return { p: `nick:${fallbackName}`, n: fallbackName };
   }
 
-  function setReactionUsers(target, emoji, users) {
+  function setReactionUsers(target: string, emoji: string, users: ReactionActor[]) {
     const forMessage = { ...(reactions[target] ?? {}) };
     if (users.length > 0) forMessage[emoji] = users;
     else delete forMessage[emoji];
@@ -643,7 +659,7 @@ $effect(() => {
     reactions = next;
   }
 
-  function applyReaction(actor, target, emoji, action) {
+  function applyReaction(actor: ReactionActor, target: string, emoji: string, action: 'add' | 'remove') {
     const users = reactions[target]?.[emoji] ?? [];
     if (action === 'add') {
       if (!users.some((u) => u.p === actor.p)) setReactionUsers(target, emoji, [...users, actor]);
@@ -652,12 +668,14 @@ $effect(() => {
     }
   }
 
-  function applyReactionEvent(msg) {
+  function applyReactionEvent(msg: ChatMessage) {
     const payload = reactionPayloadOf(msg);
-    if (payload) applyReaction(actorOf(payload, senderName(msg)), payload.t, payload.e, payload.a);
+    if (payload && payload.t && payload.e) {
+      applyReaction(actorOf(payload, senderName(msg)), payload.t, payload.e, payload.a ?? 'add');
+    }
   }
 
-  async function toggleReaction(target, emoji) {
+  async function toggleReaction(target: string, emoji: string) {
     const users = reactions[target]?.[emoji] ?? [];
     const alreadyMine = users.some((u) => u.p === me().p);
     const action = alreadyMine ? 'remove' : 'add';
@@ -674,33 +692,33 @@ $effect(() => {
     }
   }
 
-  function senderName(msg) {
+  function senderName(msg: ChatMessage): string {
     const s = msg?.sender;
     return typeof s === 'string' && s.trim() ? s : 'Unknown';
   }
 
-  function senderInitials(msg) {
+  function senderInitials(msg: ChatMessage): string {
     return (senderName(msg).trim().slice(0, 2) || '?').toUpperCase();
   }
 
-  function shortPeer(peer, len = 12) {
+  function shortPeer(peer: string | null | undefined, len = 12): string {
     return typeof peer === 'string' ? `${peer.slice(0, len)}...` : '';
   }
 
-  function gifTileUrl(gif) {
+  function gifTileUrl(gif: KlipyGif | null | undefined): string {
     return gif?.file?.hd?.gif?.url || gif?.file?.sd?.gif?.url || '';
   }
 
-  let failedMediaUrls = $state([]);
+  let failedMediaUrls = $state<string[]>([]);
 
-  function handleMediaError(url) {
+  function handleMediaError(url: string) {
     console.warn('[portsidepeer] media failed to load (CSP-blocked, offline, or dead URL):', url);
     if (!failedMediaUrls.includes(url)) failedMediaUrls = [...failedMediaUrls, url];
   }
 
-  function clickOutside(node, callback) {
-    const onClick = (event) => {
-      if (!node.contains(event.target)) callback?.();
+  function clickOutside(node: HTMLElement, callback?: () => void) {
+    const onClick = (event: MouseEvent) => {
+      if (!node.contains(event.target as Node | null)) callback?.();
     };
     document.addEventListener('click', onClick);
     return {
@@ -742,7 +760,7 @@ $effect(() => {
     }
   }
 
-  async function shareGif(gifUrl) {
+  async function shareGif(gifUrl: string) {
     if (!gifUrl) return;
     const uid = crypto.randomUUID();
     const specializedGifPayload = `P2P_MEDIA_GIF:${gifUrl}`;
@@ -1018,7 +1036,7 @@ $effect(() => {
     }).slice(0, 80);
   });
 
-  const stripVariation = (e) => e.replace(/\uFE0F/g, '');
+  const stripVariation = (e: string) => e.replace(/\uFE0F/g, '');
   const KEYWORD_INDEX = new Map(
     Object.entries(EMOJI_KEYWORDS).map(([e, k]) => [stripVariation(e), k.toLowerCase()])
   );
@@ -1041,7 +1059,7 @@ $effect(() => {
     ])
   );
 
-  function previewOf(msg) {
+  function previewOf(msg: ChatMessage): string {
     const body = displayBody(msg);
       if (extractGifUrl(body)) return 'a GIF';
       if (extractImageInfo(body)) return 'an image';
@@ -1049,7 +1067,7 @@ $effect(() => {
       return body;
   }
 
-  function openFullReactionPicker(msg) {
+  function openFullReactionPicker(msg: ChatMessage) {
     reactTarget = { key: messageKey(msg), preview: previewOf(msg) };
     emojiMode = 'react';
     emojiSearchQuery = '';
@@ -1065,7 +1083,7 @@ $effect(() => {
     emojiSearchQuery = '';
   }
 
-  function pickEmoji(emoji) {
+  function pickEmoji(emoji: string) {
     pushRecentEmoji(emoji);
     if (emojiMode === 'react' && reactTarget) {
       toggleReaction(reactTarget.key, emoji);
@@ -1076,7 +1094,7 @@ $effect(() => {
     composerInputEl?.focus();
   }
 
-  async function saveRelay(e) {
+  async function saveRelay(e: SubmitEvent) {
     e.preventDefault();
     if (!relayPeerId.trim() || !relayAddress.trim()) return;
     try {
@@ -1100,7 +1118,7 @@ $effect(() => {
     }
   }
 
-  async function saveKlipyKey(e) {
+  async function saveKlipyKey(e: SubmitEvent) {
     e.preventDefault();
     if (!klipyKeyInput.trim()) return;
     try {
@@ -1123,7 +1141,7 @@ $effect(() => {
     }
   }
 
-  async function dialPeerViaRelay(e) {
+  async function dialPeerViaRelay(e: SubmitEvent) {
     e.preventDefault();
     if (!dialAddress.trim()) return;
     try {
@@ -1143,9 +1161,8 @@ $effect(() => {
   }
 
   onMount(() => {
-    let unlisteners = [];
-
-    let unlistenDrag = null;
+    let unlisteners: Array<() => void> = [];
+    let unlistenDrag: (() => void) | null = null;
 
     async function setupDragDrop() {
       const webview = getCurrentWebview();
@@ -1160,10 +1177,10 @@ $effect(() => {
 
     setupDragDrop()
 
-    const pasteListener = (e) => handlePaste(e);
+    const pasteListener = (e: ClipboardEvent) => handlePaste(e);
     window.addEventListener('paste', pasteListener);
 
-    const safe = async (label, fn) => {
+    const safe = async (label: string, fn: () => any) => {
       try {
         return await fn();
       } catch (err) {
@@ -1172,7 +1189,7 @@ $effect(() => {
       }
     };
 
-    const addListener = async (name, handler) => {
+    const addListener = async (name: string, handler: (event: { payload: any }) => void) => {
       try {
         unlisteners.push(await listen(name, handler));
       } catch (err) {
@@ -1311,7 +1328,7 @@ $effect(() => {
     };
   });
 
-  async function sendMessage(e) {
+  async function sendMessage(e: SubmitEvent) {
     e.preventDefault();
     if (!inputMessage.trim()) return;
     const uid = crypto.randomUUID();
@@ -1329,10 +1346,10 @@ $effect(() => {
     showEmojiPicker = false;
   }
 
-  async function saveNickname(e) {
+  async function saveNickname(e: SubmitEvent) {
     e.preventDefault();
     try {
-      const updatedProfile = await invoke('update_nickname', { newName: nicknameInput });
+      const updatedProfile = await invoke<{ nickname: string }>('update_nickname', { newName: nicknameInput });
       userNickname = updatedProfile.nickname;
       editMode = false;
     } catch (err) {
@@ -1340,7 +1357,7 @@ $effect(() => {
     }
   }
 
-  async function acceptPeer(peerId) {
+  async function acceptPeer(peerId: string) {
     try {
       const updatedList = await invoke('add_to_allow_list', { targetFriendPeerId: peerId });
 
@@ -1351,7 +1368,7 @@ $effect(() => {
     }
   }
 
-  async function revokeAccess(peerId) {
+  async function revokeAccess(peerId: string) {
     try {
       const updatedList = await invoke('remove_from_allow_list', { targetPeerId: peerId });
       allowedPeers = Array.isArray(updatedList) ? updatedList : [];
@@ -1360,14 +1377,14 @@ $effect(() => {
     }
   }
 
-  function handleManualSubmit(e) {
+  function handleManualSubmit(e: SubmitEvent) {
     e.preventDefault();
     if (!targetFriendId.trim()) return;
     acceptPeer(targetFriendId.trim());
     targetFriendId = '';
   }
 
-  function handlePaste(e) {
+  function handlePaste(e: ClipboardEvent) {
     const items = e.clipboardData?.items;
     if (items) {
       for (const item of items) {
@@ -1389,10 +1406,10 @@ $effect(() => {
     }
   }
 
-  async function shareLocalPathAsFile(path) {
+  async function shareLocalPathAsFile(path: string) {
     const uid = crypto.randomUUID();
     try {
-      const info = await invoke('send_file', { path, uid, room: activeRoom });
+      const info = await invoke<FileInfo>('send_file', { path, uid, room: activeRoom });
       sentFiles = { ...sentFiles, [uid]: path };
 
       const marker = isImageFile(info.name) ? IMAGE_MARKER : FILE_MARKER;
@@ -1401,25 +1418,25 @@ $effect(() => {
     } catch (err) { }
   }
 
-  function selectCircuitAddr(e) {
-    e.target.select();
+  function selectCircuitAddr(e: MouseEvent) {
+    (e.currentTarget as HTMLTextAreaElement).select();
   }
 
-  function displayReply(body) {
+  function displayReply(body: string) {
     const parentKey = replyParentOf(body);
     if (!parentKey) return { parentKey: null, text: body };
     const rest = body.slice(body.indexOf('\n') + 1);
     return { parentKey, text: rest };
   }
 
-  async function shareBlobAsFile(file) {
+  async function shareBlobAsFile(file: File) {
     if (!file) return;
     try {
       const bytes = new Uint8Array(await file.arrayBuffer());
       const ext = (file.name?.split('.').pop() ?? 'png').toLowerCase();
       const uid = crypto.randomUUID();
 
-      const path = await invoke('save_temp_media', { data: Array.from(bytes), ext });
+      const path = await invoke<string>('save_temp_media', { data: Array.from(bytes), ext });
       const info = await invoke('send_file', { path, uid, room: activeRoom });
       sentFiles = { ...sentFiles, [uid]: path };
       messages = [...messages, { uid, sender_pid: userPeerId, room: activeRoom, sender: userNickname, body: `${FILE_MARKER}${JSON.stringify(info)}` }];
@@ -1429,7 +1446,7 @@ $effect(() => {
     }
   }
 
-  async function handleDrop(e) {
+  async function handleDrop(e: DragEvent) {
     console.log('[drop-debug] drop fired, files:', e.dataTransfer?.files?.length);
     e.preventDefault();
     const files = Array.from(e.dataTransfer?.files ?? []);
@@ -1450,7 +1467,7 @@ $effect(() => {
       <div class="panel-section">
         <h4>My Identity Key</h4>
         <p>Give this to friends so they can whitelist you:</p>
-        <textarea readonly class="id-share-box" value={userPeerId} onclick={(e) => e.target.select()}></textarea>
+        <textarea readonly class="id-share-box" value={userPeerId} onclick={(e) => e.currentTarget.select()}></textarea>
       </div>
 
       <div class="panel-section">

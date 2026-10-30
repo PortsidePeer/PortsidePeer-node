@@ -15,6 +15,7 @@ Decentralized peer to peer chat app built for the user and not for data centers.
 - Send Files to everyone in the chatroom.
 - Message history stored locally.
 - Notifications of messages while away
+- Profile avatars
 
 ### How it works
 
