@@ -1,5 +1,30 @@
 <script lang="ts">
 
+import type {
+  ChatMessage,
+  Room,
+  FileInfo,
+  ReactionActor,
+  FileProgressInfo,
+  ReactTarget,
+  SharedFileInfo
+} from '$lib/types';
+
+import {
+  REACT_MARKER, ROOM_MARKER, REPLY_MARKER, FILE_MARKER, AVATAR_MARKER,
+  messageKey, displayBody, previewFor, previewOf, replyPreviewOf,
+  roomEventPayloadOf, reactionPayloadOf, avatarPayloadOf, actorOf, extractImageInfo,
+  senderName, roomOf, roomIsVisible, activeRoomNameFor, shouldNotify
+} from '$lib/markers';
+
+import { shareTempFile, buildMediaBody, fileUrlToPath } from '$lib/api';
+
+import MessageItem from '$lib/components/MessageItem.svelte';
+
+import Composer from '$lib/components/Composer.svelte';
+
+import RoomSidebar from '$lib/components/RoomSidebar.svelte';
+
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
@@ -8,68 +33,28 @@
   import { convertFileSrc } from '@tauri-apps/api/core';
 
   import {
-    isPermissionGranted,
-    requestPermission,
     sendNotification
   } from '@tauri-apps/plugin-notification';
 
-  interface Room { id: string; name: string }
-  interface ReactionActor { p: string; n?: string }
-  interface ReactionPayload { e?: string; t?: string; p?: string; n?: string; a?: 'add' | 'remove' }
-  interface RoomEventPayload { a: 'create' | 'rename'; id: string; name: string }
-  interface ReactTarget { key: string; preview: string }
-  interface KlipyGif {
-    title?: string;
-    file?: { hd?: { gif?: { url?: string } }; sd?: { gif?: { url?: string } } };
-  }
-  interface AvatarPayload { p: string; d: string }
-  interface FileProgressInfo { received: number; total: number }
-
-
-  type ChatMessage = {
-      uid?: string;
-      room?: string;
-      sender: string;
-      sender_pid?: string;
-      channel?: string;
-      body: string;
-      timestamp?: string;
-      id?: number;
-  };
-  interface FileInfo { id: string; name: string; size?: number }
-
   let messages = $state<ChatMessage[]>([]);
-  let inputMessage = $state('');
   let userNickname = $state('Loading...');
   let userPeerId = $state('');
-  let editMode = $state(false);
-  let nicknameInput = $state('');
 
   // Notifications
-  let notificationsGranted = $state(false);
   let notificationsEnabled = $state(true);
   let mutedRooms = $state<Record<string, boolean>>({});
   let unreadByRoom = $state<Record<string, number>>({});
 
   let allowedPeers = $state<string[]>([]);
-  let targetFriendId = $state('');
   let discoveredPeers = $state<string[]>([]);
 
-  let showGifPanel = $state(false);
-  let gifSearchQuery = $state('');
-  let searchResults = $state<KlipyGif[]>([]);
-  let isSearchingGifs = $state(false);
-
   let showEmojiPicker = $state(false);
+  let emojiMode = $state<'compose' | 'react'>('compose');
 
-  let relayPeerId = $state('');
-  let relayAddress = $state('');
   let relaySaved = $state(false);
   let relayConnected = $state(false);
   let relayListening = $state(false);
   let myCircuitAddress = $state('');
-  let dialAddress = $state('');
-  let showRelayPanel = $state(false);
   let reactions = $state<Record<string, Record<string, ReactionActor[]>>>({});
   let reactionPickerFor = $state<string | null>(null);
   let reactionPickerFlip = $state(false);
@@ -78,21 +63,18 @@
   const RECENT_EMOJI_KEY = 'portsidepeer-recent-emoji';
   const RECENT_EMOJI_MAX = 16;
 
-  let emojiMode = $state('compose');
   let reactTarget = $state<ReactTarget | null>(null);
-  let emojiSearchQuery = $state('');
 
   let sentFiles = $state<Record<string, string>>({});
   let receivedFiles = $state<Record<string, string>>({});
   let fileProgress = $state<Record<string, FileProgressInfo>>({});
 
   let klipyApiKey = $state('');
-  let klipyKeyInput = $state('');
   let klipySaved = $state(false);
 
   let messageLogEl = $state<HTMLDivElement | null>(null);
   let messageLogInnerEl = $state<HTMLDivElement | null>(null);
-  let composerInputEl: HTMLInputElement;
+  let composer = $state<Composer>();
   let initialJumpDone = false;
   let lastAutoScrollAt = 0;
   let pinnedToBottom = true;
@@ -104,10 +86,6 @@
   let activeRoom = $state('sbb-lounge');
   let roomNameInput = $state('');
   let editingRoom = $state(false);
-  let showNewRoom = $state(false);
-  let newRoomInput = $state('');
-
-  const ROOM_MARKER = 'P2P_ROOM:';
 
   type ReplyTarget = {
     key: string;
@@ -117,21 +95,6 @@
 
   let replyTo = $state<ReplyTarget | null>(null);
 
-  const REPLY_MARKER = 'P2P_REPLY:';
-
-  function replyPreviewOf(msg: ChatMessage): string {
-    const body = displayBody(msg);
-      if (extractGifUrl(body)) return 'a GIF';
-      if (extractImageUrl(body)) return 'an image';
-      if (extractFileInfo(body)) return 'a file';
-      const replyParent = replyParentOf(body);
-      if (replyParent !== null) {
-        const text = body.slice(body.indexOf('\n') + 1);
-        return text.slice(0, 80) || 'a reply';
-      }
-    return body.slice(0, 80);
-  }
-
   function startReply(msg: ChatMessage) {
     replyTo = {
       key: messageKey(msg),
@@ -139,29 +102,14 @@
       preview: replyPreviewOf(msg)
     };
     showEmojiPicker = false;
-    composerInputEl?.focus();
+    composer?.focusInput();
   }
 
   function cancelReply() {
     replyTo = null;
   }
 
-  const IMAGE_MARKER = 'P2P_MEDIA_IMAGE:';
-
   let imageSrcs = $state<Record<string, string>>({});
-
-  function extractImageInfo(body: string) {
-    if (typeof body !== 'string' || !body.startsWith(IMAGE_MARKER)) return null;
-    try {
-      const info = JSON.parse(body.slice(IMAGE_MARKER.length));
-      if (typeof info?.id === 'string' && typeof info?.name === 'string') return info;
-    } catch {}
-    return null;
-  }
-
-  function isImageFile(name: string) {
-    return /\.(png|jpe?g|gif|webp|avif|bmp)$/i.test(name ?? '');
-  }
 
   async function resolveImageSrc(info: FileInfo) {
     if (imageSrcs[info.id]) return;
@@ -176,25 +124,6 @@
       imageSrcs = { ...imageSrcs, [info.id]: convertFileSrc(path) };
     } catch {
     }
-  }
-
-  function messageByKey(key: string): ChatMessage | null {
-    if (typeof key !== 'string') return null;
-    if (key.startsWith('uid:')) {
-      const uid = key.slice(4);
-      return messages.find((m) => m.uid === uid) ?? null;
-    }
-    if (key.startsWith('legacy:')) {
-      const raw = key.slice(7);
-      const idx = raw.lastIndexOf('::');
-      if (idx === -1) return null;
-      return (
-        messages.find(
-          (m) => !m.uid && senderName(m) === raw.slice(0, idx) && displayBody(m) === raw.slice(idx + 2)
-        ) ?? null
-      );
-    }
-    return null;
   }
 
   const NOTIF_PREFS_KEY = 'portsidepeer-notification-prefs';
@@ -234,37 +163,6 @@
     }
   }
 
-  function roomIsVisible(room: string): boolean {
-    return room === activeRoom && document.hasFocus();
-  }
-
-  function activeRoomNameFor(id: string): string {
-    return rooms.find((c) => c.id === id)?.name ?? id;
-  }
-
-  function previewFor(msg: ChatMessage): string {
-    const body = displayBody(msg);
-    if (extractGifUrl(body)) return 'Sent a GIF';
-    if (extractImageUrl(body)) return 'Sent an image';
-    if (extractImageInfo(body)) return 'Sent an image';
-    const fileInfo = extractFileInfo(body);
-    if (fileInfo) return `Sent a file: ${fileInfo.name}`;
-    const replyParent = replyParentOf(body);
-    if (replyParent !== null) {
-      const text = body.slice(body.indexOf('\n') + 1);
-      return `↩ ${text.slice(0, 80) || 'Sent a reply'}`;
-    }
-    return body.slice(0, 80) || 'Sent a message';
-  }
-
-  function shouldNotify(msg: ChatMessage): boolean {
-    if (!notificationsGranted || !notificationsEnabled) return false;
-    if (senderName(msg) === userNickname) return false;
-    if (reactionPayloadOf(msg) || roomEventPayloadOf(msg) || avatarPayloadOf(msg)) return false;
-    if (mutedRooms[roomOf(msg)]) return false;
-    return !roomIsVisible(roomOf(msg));
-  }
-
   function loadRecentEmoji() {
     try {
       const saved = JSON.parse(localStorage.getItem(RECENT_EMOJI_KEY) ?? '[]');
@@ -288,15 +186,15 @@
   function notifyNewMessage(msg: ChatMessage) {
     const room = roomOf(msg);
 
-    if (senderName(msg) !== userNickname && !roomIsVisible(room)) {
+    if (senderName(msg) !== userNickname && !roomIsVisible(room, activeRoom)) {
       unreadByRoom = { ...unreadByRoom, [room]: (unreadByRoom[room] ?? 0) + 1 };
     }
 
-    if (!shouldNotify(msg)) return;
+    if (!shouldNotify(msg, activeRoom, mutedRooms, userNickname)) return;
 
     try {
       sendNotification({
-        title: `${senderName(msg)} • #${activeRoomNameFor(room)}`,
+        title: `${senderName(msg)} • #${activeRoomNameFor(rooms, activeRoom)}`,
         body: previewFor(msg),
       });
     } catch (err) {
@@ -304,41 +202,10 @@
     }
   }
 
-  function replyParentOf(body: string): string | null {
-    if (typeof body !== 'string' || !body.startsWith(REPLY_MARKER)) return null;
-    const newline = body.indexOf('\n');
-    const jsonPart = newline === -1 ? body.slice(REPLY_MARKER.length) : body.slice(REPLY_MARKER.length, newline);
-    try {
-      const payload = JSON.parse(jsonPart);
-      if (typeof payload?.t === 'string') return payload.t;
-    } catch { }
-    return null;
-  }
-
-  function slugify(name: string): string {
-    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
-    return slug || 'room';
-  }
-
-  function roomOf(msg: ChatMessage): string {
-    return typeof msg?.room === 'string' && msg.room ? msg.room : 'sbb-lounge';
-  }
-
   function activeRoomName() {
     return rooms.find((c) => c.id === activeRoom)?.name ?? activeRoom;
   }
 
-  function roomEventPayloadOf(msg: ChatMessage): RoomEventPayload | null {
-    const body = displayBody(msg);
-    if (typeof body !== 'string' || !body.startsWith(ROOM_MARKER)) return null;
-    try {
-      const payload = JSON.parse(body.slice(ROOM_MARKER.length));
-      if (typeof payload?.id === 'string' && typeof payload?.name === 'string' && (payload.a === 'create' || payload.a === 'rename')) return payload;
-    } catch { }
-    return null;
-  }
-
-  const AVATAR_MARKER = 'P2P_AVATAR:';
   const AVATAR_MAX_BYTES = 32 * 1024;
   let avatars = $state<Record<string, string>>({});
 
@@ -391,26 +258,11 @@
     return null;
   }
 
-  function avatarPayloadOf(msg: ChatMessage): AvatarPayload | null {
-    const body = displayBody(msg);
-    if (typeof body !== 'string' || !body.startsWith(AVATAR_MARKER)) return null;
-    try {
-      const payload = JSON.parse(body.slice(AVATAR_MARKER.length));
-      if (typeof payload?.p === 'string' && typeof payload?.d === 'string') return payload;
-    } catch {}
-    return null;
-  }
-
   function applyAvatarEvent(msg: ChatMessage) {
     const payload = avatarPayloadOf(msg);
     if (!payload) return;
     if (msg.sender_pid && payload.p !== msg.sender_pid) return;
     avatars = { ...avatars, [payload.p]: `data:image/jpeg;base64,${payload.d}` };
-  }
-
-  function avatarFor(msg: ChatMessage): string | null {
-    const pid = msg.sender_pid ?? `nick:${senderName(msg)}`;
-    return avatars[pid] ?? null;
   }
 
   async function applyRoomEvent(msg: ChatMessage) {
@@ -433,12 +285,7 @@
     }
   }
 
-  async function createRoom(e: SubmitEvent) {
-    e.preventDefault();
-    const name = newRoomInput.trim();
-    if (!name) return;
-    let id = slugify(name);
-    if (rooms.some((c) => c.id === id)) id = `${id}-${Math.random().toString(36).slice(2, 6)}`;
+  async function createRoom(id: string, name: string): Promise<boolean> {
     try {
       const info = await invoke<Room>('create_room', { id, name });
       rooms = [...rooms, info];
@@ -448,10 +295,10 @@
         room: activeRoom
       });
       activeRoom = id;
-      showNewRoom = false;
-      newRoomInput = '';
+      return true;
     } catch (err) {
       alert(err);
+      return false;
     }
   }
 
@@ -478,6 +325,25 @@
     messages.filter((m) => roomOf(m) === activeRoom)
   );
 
+  $effect(() => {
+    const count = visibleMessages.length;
+    if (count === 0) return;
+
+    if (!initialJumpDone) {
+      scrollToBottom('smooth');
+      initialJumpDone = true;
+      return;
+    }
+
+    const lastMsg = visibleMessages[count - 1];
+    const isOwnMessage = lastMsg?.sender === userNickname;
+    const stillAnimating = Date.now() - lastAutoScrollAt < 900;
+
+    if (isOwnMessage || stillAnimating || pinnedToBottom) {
+      scrollToBottom('smooth');
+    }
+  });
+
   function isNearBottom() {
     if (!messageLogEl) return true;
     return (
@@ -497,25 +363,6 @@
   }
 
   $effect(() => {
-    const count = visibleMessages.length;
-    if (count === 0) return;
-
-    if (!initialJumpDone) {
-      scrollToBottom('auto');
-      initialJumpDone = true;
-      return;
-    }
-
-    const lastMsg = visibleMessages[count - 1];
-    const isOwnMessage = lastMsg?.sender === userNickname;
-    const stillAnimating = Date.now() - lastAutoScrollAt < 900;
-
-    if (isOwnMessage || stillAnimating || pinnedToBottom) {
-      scrollToBottom('smooth');
-    }
-  });
-
-  $effect(() => {
     const inner = messageLogInnerEl;
     if (!inner || typeof ResizeObserver === 'undefined') return;
     const observer = new ResizeObserver(() => {
@@ -527,7 +374,7 @@
 
 $effect(() => {
    activeRoom;
-   scrollToBottom('auto');
+   scrollToBottom('smooth');
  });
 
 $effect(() => {
@@ -538,39 +385,6 @@ $effect(() => {
    }
  }
 });
-
-  function escapeRegExp(str: string): string {
-    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  }
-
-  function displayBody(msg: ChatMessage): string {
-    const raw = typeof msg?.body === 'string' ? msg.body : '';
-    const sender = typeof msg?.sender === 'string' ? msg.sender.trim() : '';
-    if (sender) {
-      const prefix = new RegExp(`^${escapeRegExp(sender)}\\s*:\\s*`);
-      if (prefix.test(raw)) return raw.replace(prefix, '');
-    }
-    return raw;
-  }
-
-  const FILE_MARKER = 'P2P_MEDIA_FILE:';
-
-  function extractFileInfo(body: string): FileInfo | null {
-    if (typeof body !== 'string' || !body.startsWith(FILE_MARKER)) return null;
-    try {
-      const info = JSON.parse(body.slice(FILE_MARKER.length));
-      if (typeof info?.id === 'string' && typeof info?.name === 'string' && typeof info?.size === 'number') return info;
-    } catch {}
-    return null;
-  }
-
-  function formatBytes(input?: number): string {
-    const n = input ?? 0;
-    if (n < 1024) return `${n} B`;
-    if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
-    if (n < 1073741824) return `${(n / 1048576).toFixed(1)} MB`;
-    return `${(n / 1073741824).toFixed(2)} GB`;
-  }
 
   async function attachFile() {
     try {
@@ -597,55 +411,10 @@ $effect(() => {
     }
   }
 
-  const GIF_MARKER = 'P2P_MEDIA_GIF:';
-
-  function extractGifUrl(rawBody: string): string | null {
-    const body = typeof rawBody === 'string' ? rawBody : '';
-    const idx = body.indexOf(GIF_MARKER);
-    if (idx === -1) return null;
-    const url = body.slice(idx + GIF_MARKER.length).trim();
-    return url || null;
-  }
-
-  // Image urls
-  function extractImageUrl(body: string): string | null {
-    const text = typeof body === 'string' ? body.trim() : '';
-    if (!text || /\s/.test(text)) return null;
-    if (!/^https:\/\//i.test(text)) return null;
-    if (/[<>"'`\\]/.test(text)) return null;
-    return /\.(png|jpe?g|gif|webp|avif|bmp)(\?|#|$)/i.test(text) ? text : null;
-  }
-
-  // Reactions
-  const REACT_MARKER = 'P2P_REACT:';
-  const QUICK_REACTIONS = ['👍', '❤️', '😂', '😮', '😢', '🎉', '🍻', '💩'];
-
-  function messageKey(msg: ChatMessage): string {
-    if (typeof msg?.uid === 'string' && msg.uid) return `uid:${msg.uid}`;
-    return `legacy:${senderName(msg)}::${displayBody(msg)}`;
-  }
-
-  function reactionPayloadOf(msg: ChatMessage): ReactionPayload | null {
-    const body = displayBody(msg);
-    if (typeof body !== 'string' || !body.startsWith(REACT_MARKER)) return null;
-    try {
-      const payload = JSON.parse(body.slice(REACT_MARKER.length));
-      if (typeof payload?.t === 'string' && typeof payload?.e === 'string') return payload;
-    } catch {}
-    return null;
-  }
-
   function me() {
     return userPeerId
       ? { p: userPeerId, n: userNickname }
       : { p: `nick:${userNickname}`, n: userNickname };
-  }
-
-  function actorOf(payload: ReactionPayload, fallbackName: string): ReactionActor {
-    if (typeof payload?.p === 'string' && payload.p) {
-      return { p: payload.p, n: typeof payload.n === 'string' && payload.n ? payload.n : fallbackName };
-    }
-    return { p: `nick:${fallbackName}`, n: fallbackName };
   }
 
   function setReactionUsers(target: string, emoji: string, users: ReactionActor[]) {
@@ -692,72 +461,11 @@ $effect(() => {
     }
   }
 
-  function senderName(msg: ChatMessage): string {
-    const s = msg?.sender;
-    return typeof s === 'string' && s.trim() ? s : 'Unknown';
-  }
-
-  function senderInitials(msg: ChatMessage): string {
-    return (senderName(msg).trim().slice(0, 2) || '?').toUpperCase();
-  }
-
-  function shortPeer(peer: string | null | undefined, len = 12): string {
-    return typeof peer === 'string' ? `${peer.slice(0, len)}...` : '';
-  }
-
-  function gifTileUrl(gif: KlipyGif | null | undefined): string {
-    return gif?.file?.hd?.gif?.url || gif?.file?.sd?.gif?.url || '';
-  }
-
   let failedMediaUrls = $state<string[]>([]);
 
   function handleMediaError(url: string) {
     console.warn('[portsidepeer] media failed to load (CSP-blocked, offline, or dead URL):', url);
     if (!failedMediaUrls.includes(url)) failedMediaUrls = [...failedMediaUrls, url];
-  }
-
-  function clickOutside(node: HTMLElement, callback?: () => void) {
-    const onClick = (event: MouseEvent) => {
-      if (!node.contains(event.target as Node | null)) callback?.();
-    };
-    document.addEventListener('click', onClick);
-    return {
-      destroy() {
-        document.removeEventListener('click', onClick);
-      }
-    };
-  }
-
-  async function searchGifs() {
-    if (!klipyApiKey) return;
-      if (!gifSearchQuery.trim()) {
-        searchResults = [];
-        return;
-    }
-    isSearchingGifs = true;
-    try {
-      const queryText = encodeURIComponent(gifSearchQuery.trim());
-      const response = await fetch(
-        `https://api.klipy.com/api/v1/${klipyApiKey}/gifs/search?q=${queryText}`,
-        {
-          method: "GET",
-          headers: {
-            "Accept": "application/json",
-            "Content-Type": "application/json"
-          }
-        }
-      );
-
-      if (!response.ok) throw new Error(`HTTP Error: ${response.status}`);
-
-      const payload = await response.json();
-      searchResults = payload?.data?.data || [];
-    } catch (err) {
-      console.error("GIF search failed:", err);
-      searchResults = [];
-    } finally {
-      isSearchingGifs = false;
-    }
   }
 
   async function shareGif(gifUrl: string) {
@@ -766,368 +474,41 @@ $effect(() => {
     const specializedGifPayload = `P2P_MEDIA_GIF:${gifUrl}`;
     messages = [...messages, { uid, sender_pid: userPeerId, room: activeRoom, sender: userNickname, body: specializedGifPayload }];
     await invoke('send_chat_message', { message: specializedGifPayload, uid, room: activeRoom });
-    showGifPanel = false;
-    gifSearchQuery = '';
-    searchResults = [];
   }
 
-  let activeEmojiCategory = $state(0);
-
-  const EMOJI_CATEGORIES = [
-    {
-      name: 'Smileys & Faces',
-      icon: '😀',
-      emojis: [
-        '😀','😃','😄','😁','😆','😅','🤣','😂','🙂','🙃',
-        '😉','😊','😇','🥰','😍','🤩','😘','😗','😚','😙',
-        '🥲','😋','😛','😜','🤪','😝','🤑','🤗','🤭','🤫',
-        '🤔','🤐','🤨','😐','😑','😶','😏','😒','🙄','😬',
-        '🤥','😌','😔','😪','🤤','😴','😷','🤒','🤕','🤢',
-        '🤮','🥵','🥶','😵','🤯','🤠','🥳','🥸','😎','🤓',
-        '🧐','😕','😟','🙁','😮','😯','😲','😳','🥺','😦',
-        '😧','😨','😰','😥','😢','😭','😱','😖','😣','😞',
-        '😓','😩','😫','🥱','😤','😡','😠','🤬','😈','👿',
-        '💀','☠️','💩','🤡','👹','👻','👽','🤖','😺','😹',
-        '😻','😼','😽','😾','😿','🙀'
-      ]
-    },
-    {
-      name: 'People & Gestures',
-      icon: '👍',
-      emojis: [
-        '👍','👎','👌','🤌','🤏','✌️','🤞','🤟','🤘','🤙',
-        '👈','👉','👆','👇','☝️','👋','🤚','🖐️','✋','🖖',
-        '👏','🙌','🤲','🤝','🙏','💪','🦾','✍️','💅','🤳',
-        '👀','👁️','👄','🫦','🧠','🦷','🦴','👶','🧒','👦',
-        '👧','🧑','👨','🧔','👩','🧓','👴','👵','🙍','🙎',
-        '🙅','🙆','💁','🙋','🧏','🙇','🤦','🤷','💃','🕺',
-        '👯','🧘','🏃','🚶'
-      ]
-    },
-    {
-      name: 'Celebration & Activity',
-      icon: '🎉',
-      emojis: [
-        '🎉','🎊','🎈','🎁','🎀','🏅','🏆','🥇','🥈','🥉',
-        '⚽','⚾','🏀','🏈','🏐','🏉','🎾','🎳','🏏','🏑',
-        '🏒','🏓','🏸','🥊','🥋','⛳','🏹','🎣','🥅','🎮',
-        '🕹️','🎲','🧩','🎯','🎰','🪀','🪁','🎤','🎧','🎼',
-        '🎹','🥁','🎷','🎺','🎸','🎻','🎬','🎨','🎭','🎪',
-        '🎟️','🎫'
-      ]
-    },
-    {
-      name: 'Animals & Nature',
-      icon: '🐶',
-      emojis: [
-        '🐶','🐱','🐭','🐹','🐰','🦊','🐻','🐼','🐨','🐯',
-        '🦁','🐮','🐷','🐸','🐵','🙈','🙉','🙊','🐔','🐧',
-        '🐦','🐤','🦆','🦅','🦉','🦇','🐺','🐗','🐴','🦄',
-        '🐝','🐛','🦋','🐌','🐞','🐜','🦂','🐢','🐍','🦎',
-        '🐙','🦑','🦐','🦀','🐡','🐠','🐟','🐬','🐳','🐋',
-        '🦈','🐊','🐘','🦒','🦓','🦍','🦏','🐪','🐫','🦘',
-        '🐃','🐄','🐎','🐖','🐏','🐑','🐐','🦌','🐕','🐩',
-        '🐈','🐓','🦃','🦚','🦜','🦢','🕊️','🐇','🦝','🦔',
-        '🐾','🌵','🌲','🌳','🌴','🌱','🌿','☘️','🍀','🎍',
-        '🎋','🍃','🍂','🍁','🌾','🌺','🌻','🌹','🥀','🌷',
-        '🌼','🌸','💐','🍄','🌰','🌍','🌎','🌏','🌕','⭐',
-        '🌟','✨','⚡','🔥','🌈','☀️','⛅','☁️','🌧️','⛈️',
-        '❄️','☃️','⛄','🌪️','🌫️','🌊','💧'
-      ]
-    },
-    {
-      name: 'Food & Drink',
-      icon: '🍕',
-      emojis: [
-        '🍏','🍎','🍐','🍊','🍋','🍌','🍉','🍇','🍓','🫐',
-        '🍒','🍑','🥭','🍍','🥥','🥝','🍅','🍆','🥑','🥦',
-        '🥬','🥒','🌽','🥕','🧄','🧅','🥔','🍠','🍞','🥐',
-        '🥖','🥨','🧇','🥞','🧈','🍳','🥚','🧀','🥓','🍗',
-        '🍖','🌭','🍔','🍟','🍕','🥪','🥙','🌮','🌯','🥗',
-        '🥘','🍝','🍜','🍲','🍛','🍣','🍱','🥟','🍤','🍙',
-        '🍚','🍘','🍥','🥠','🍢','🍡','🍧','🍨','🍦','🥧',
-        '🧁','🍰','🎂','🍮','🍭','🍬','🍫','🍿','🍩','🍪',
-        '☕','🍵','🧃','🥤','🧋','🍺','🍻','🥂','🍷','🥃',
-        '🍸','🍹','🍾','🥄','🍴','🍽️'
-      ]
-    },
-    {
-      name: 'Travel & Places',
-      icon: '🚗',
-      emojis: [
-        '🚗','🚕','🚌','🚎','🏎️','🚓','🚑','🚒','🚐','🛻',
-        '🚚','🚛','🚜','🛵','🏍️','🚲','🛴','🚨','🚦','🚧',
-        '⚓','⛵','🚤','🛳️','⛴️','🚢','✈️','🛫','🛬','🚀',
-        '🛸','🚁','🗺️','🏔️','🏕️','🏖️','🏝️','🏟️','🏛️','🏗️',
-        '🏠','🏡','🏢','🏣','🏥','🏦','🏨','🏫','🏭','🏰',
-        '🏯','🗼','🗽','⛲','🌁','🌃','🏙️','🌄','🌅','🌇','🌉'
-      ]
-    },
-    {
-      name: 'Objects & Tech',
-      icon: '💡',
-      emojis: [
-        '⌚','📱','💻','⌨️','🖥️','🖨️','🖱️','💽','💾','💿',
-        '📀','📷','📸','📹','🎥','📞','☎️','📟','📠','📺',
-        '📻','🎙️','⏰','⏱️','⏳','📡','🔋','🔌','💡','🔦',
-        '🕯️','🧯','🪓','🔪','🗡️','🛡️','💣','🔮','📿','🧿',
-        '💈','🔭','🔬','💊','💉','🩹','🩺','🚪','🛏️','🛋️',
-        '🚽','🚿','🛁','🧴','🧹','🧺','🧻','🪣','🧼','🪥',
-        '🧽','🛒','📦','📫','📮','📪','📬','📭','💭','💬',
-        '🗯️','📄','📃','📑','📊','📈','📉','🗒️','🗓️','📅',
-        '📇','🗃️','🗳️','🗄️','📋','📁','📂','🗞️','📰','📓',
-        '📔','📒','📚','📖','🔖','🔗','📎','🖇️','📐','📏',
-        '🧮','📌','📍','✂️','🖊️','🖋️','✒️','🖌️','🖍️','📝',
-        '✏️','🔍','🔎','🔏','🔐','🔒','🔓','🔑','🗝️'
-      ]
-    },
-    {
-      name: 'Hearts & Symbols',
-      icon: '❤️',
-      emojis: [
-        '❤️','🧡','💛','💚','💙','💜','🖤','🤍','🤎','💔',
-        '❣️','💕','💞','💓','💗','💖','💘','💝','☮️','✝️',
-        '☪️','🕉️','☸️','✡️','🔯','🕎','☯️','☦️','⛎','♈',
-        '♉','♊','♋','♌','♍','♎','♏','♐','♑','♒',
-        '♓','🆔','⚛️','☢️','☣️','📴','📳','🈶','🈚','🈸',
-        '🈺','🈷️','✴️','🆚','🆕','🆙','🆗','🆒','🆓','🆖',
-        'ℹ️','Ⓜ️','🅾️','🅿️','♻️','⚠️','🚸','🔞','🚫','⛔',
-        '✅','❌','❓','❗','‼️','⁉️','💯','🔅','🔆','〽️',
-        '🔱','⚜️','🔰','〰️','➰','➿','✔️','☑️','🔘','🔴',
-        '🟠','🟡','🟢','🔵','🟣','⚫','⚪','🟤','🔺','🔻',
-        '🔸','🔹','🔶','🔷','♠️','♣️','♥️','♦️','🃏','🎴',
-        '🀄','🕐','🕑','🕒','🕓','🕔','🕕','🕖','🕗','🕘',
-        '🕙','🕚','🕛','⌛'
-      ]
-    }
-  ];
-
-  const EMOJI_KEYWORDS = {
-    // Smileys & Faces
-    '😀': 'grin happy smile cheerful',
-    '😂': 'lol laughing tears joy cry',
-    '🤣': 'rofl rolling floor laughing lol',
-    '😊': 'blush smile happy',
-    '😍': 'heart eyes love',
-    '🤩': 'star struck excited',
-    '🥳': 'party celebrate birthday',
-    '😎': 'cool sunglasses',
-    '🤓': 'nerd glasses',
-    '🤔': 'think thinking hmm',
-    '🙄': 'eyeroll annoyed',
-    '😴': 'sleep tired zzz bored',
-    '😭': 'cry crying loudly tears sad',
-    '😱': 'scream shocked scared',
-    '😡': 'angry mad rage',
-    '💀': 'skull dead death',
-    '🤖': 'robot bot',
-    '👻': 'ghost spooky halloween',
-    '💩': 'poo poop',
-    // People & Gestures
-    '👍': 'thumbs up yes ok approve like',
-    '👎': 'thumbs down no disapprove',
-    '👌': 'ok perfect',
-    '✌️': 'peace victory',
-    '🤞': 'fingers crossed luck hope',
-    '🙏': 'pray please thanks namaste',
-    '👏': 'clap applause bravo',
-    '🙌': 'praise hands hooray',
-    '💪': 'muscle strong flex arm',
-    '👋': 'wave hello hi bye',
-    '👀': 'eyes look watching',
-    '🤦': 'facepalm',
-    '🤷': 'shrug idk whatever',
-    '💃': 'dance dancing party',
-    '🕺': 'dance dancing man',
-    '🏃': 'run running',
-    '🚶': 'walk walking',
-    // Celebration & Activity
-    '🎉': 'party tada celebrate congrats confetti',
-    '🎊': 'confetti celebrate party',
-    '🎈': 'balloon party birthday',
-    '🎁': 'gift present birthday',
-    '🏆': 'trophy win winner champion',
-    '🥇': 'gold medal first winner',
-    '🎮': 'game controller video games',
-    '🎲': 'dice game random',
-    '🎯': 'dart target goal bullseye',
-    '🎤': 'mic microphone sing karaoke',
-    '🎸': 'guitar music rock',
-    '🎬': 'movie film',
-    // Animals & Nature
-    '🐶': 'dog puppy',
-    '🐱': 'cat kitten',
-    '🐰': 'rabbit bunny',
-    '🦊': 'fox',
-    '🐻': 'bear',
-    '🐼': 'panda',
-    '🦁': 'lion',
-    '🐸': 'frog',
-    '⭐': 'star',
-    '✨': 'sparkles shine magic',
-    '🔥': 'fire lit hot flame',
-    '🌈': 'rainbow pride',
-    '☀️': 'sun sunny weather',
-    '🌊': 'wave water ocean sea',
-    // Food & Drink
-    '🍕': 'pizza',
-    '🍔': 'burger hamburger',
-    '🍟': 'fries chips',
-    '🌮': 'taco mexican',
-    '🌭': 'hotdog sausage',
-    '🍦': 'ice cream',
-    '🎂': 'cake birthday',
-    '🍩': 'donut doughnut',
-    '☕': 'coffee tea cafe',
-    '🍺': 'beer brew cheers',
-    '🍻': 'beers cheers toast',
-    '🍷': 'wine drink glass',
-    // Travel & Places
-    '🚗': 'car',
-    '🚕': 'taxi cab',
-    '🚓': 'police cop car',
-    '🚑': 'ambulance',
-    '🚒': 'fire truck engine',
-    '🚀': 'rocket ship launch space',
-    '✈️': 'plane flight travel airplane',
-    '🏠': 'house home',
-    '🏰': 'castle',
-    // Objects & Tech
-    '⌚': 'watch time clock',
-    '📱': 'phone mobile smartphone',
-    '💻': 'laptop computer pc',
-    '⌨️': 'keyboard typing',
-    '🖥️': 'desktop monitor computer',
-    '📷': 'camera photo',
-    '📺': 'tv television',
-    '💡': 'idea light bulb',
-    '🔋': 'battery charge power',
-    '🔑': 'key password access',
-    '🔒': 'lock secure private locked',
-    '💬': 'speech chat message talk',
-    '🔍': 'search find magnify',
-    '📝': 'note write memo',
-    '📚': 'books reading study',
-    // Hearts & Symbols
-    '❤️': 'heart love red',
-    '🧡': 'heart orange',
-    '💛': 'heart yellow',
-    '💚': 'heart green',
-    '💙': 'heart blue',
-    '💜': 'heart purple',
-    '🖤': 'heart black',
-    '💔': 'broken heart sad breakup',
-    '💕': 'hearts love',
-    '💯': 'hundred 100 perfect',
-    '✅': 'check done yes complete',
-    '❌': 'x no wrong cancel cross',
-    '❓': 'question confused what',
-    '⚠️': 'warning caution alert',
-    '♻️': 'recycle reuse',
-    '☑️': 'checkbox checked done'
-  };
-
-  const emojiSearchResults = $derived.by(() => {
-    const terms = emojiSearchQuery.trim().toLowerCase().split(/\s+/).filter(Boolean);
-    if (terms.length === 0) return null;
-    return FLAT_EMOJIS.filter(({ emoji }) => {
-      const tokens = EMOJI_TOKENS.get(emoji) ?? [];
-      return terms.every((t) => tokens.some((tok) => tok.startsWith(t)));
-    }).slice(0, 80);
-  });
-
-  const stripVariation = (e: string) => e.replace(/\uFE0F/g, '');
-  const KEYWORD_INDEX = new Map(
-    Object.entries(EMOJI_KEYWORDS).map(([e, k]) => [stripVariation(e), k.toLowerCase()])
-  );
-
-  const CATEGORY_TERMS = EMOJI_CATEGORIES.map((cat) =>
-    cat.name.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)
-  );
-
-  const FLAT_EMOJIS = EMOJI_CATEGORIES.flatMap((cat, catIndex) =>
-    cat.emojis.map((emoji) => ({ emoji, catIndex }))
-  );
-
-  const EMOJI_TOKENS = new Map(
-    FLAT_EMOJIS.map(({ emoji, catIndex }) => [
-      emoji,
-      [
-        ...CATEGORY_TERMS[catIndex],
-        ...(KEYWORD_INDEX.get(stripVariation(emoji)) ?? '').split(/\s+/).filter(Boolean)
-      ]
-    ])
-  );
-
-  function previewOf(msg: ChatMessage): string {
-    const body = displayBody(msg);
-      if (extractGifUrl(body)) return 'a GIF';
-      if (extractImageInfo(body)) return 'an image';
-      if (extractImageUrl(body)) return 'an image';
-      return body;
-  }
-
-  function openFullReactionPicker(msg: ChatMessage) {
-    reactTarget = { key: messageKey(msg), preview: previewOf(msg) };
-    emojiMode = 'react';
-    emojiSearchQuery = '';
-    activeEmojiCategory = 0;
-    reactionPickerFor = null;
-    showEmojiPicker = true;
-  }
-
-  function closeEmojiPicker() {
-    showEmojiPicker = false;
-    emojiMode = 'compose';
-    reactTarget = null;
-    emojiSearchQuery = '';
-  }
-
-  function pickEmoji(emoji: string) {
-    pushRecentEmoji(emoji);
-    if (emojiMode === 'react' && reactTarget) {
-      toggleReaction(reactTarget.key, emoji);
-      closeEmojiPicker();
-      return;
-    }
-    inputMessage += emoji;
-    composerInputEl?.focus();
-  }
-
-  async function saveRelay(e: SubmitEvent) {
-    e.preventDefault();
-    if (!relayPeerId.trim() || !relayAddress.trim()) return;
+  async function saveRelay(peerId: string, address: string): Promise<boolean> {
     try {
-      await invoke('save_relay_endpoint', { peerId: relayPeerId, address: relayAddress });
+      await invoke('save_relay_endpoint', { peerId, address });
       relaySaved = true;
       alert("Relay endpoint saved!\n\nPlease restart the app to connect.");
+      return true;
     } catch (err) {
       alert(`Failed to save relay: ${err}`);
+      return false;
     }
   }
 
-  async function clearRelay() {
+  async function clearRelay(): Promise<boolean> {
     try {
       await invoke('clear_relay_endpoint');
-      relayPeerId = '';
-      relayAddress = '';
       relaySaved = false;
       alert("Relay cleared.\n\nPlease restart to disable.");
+      return true;
     } catch (err) {
       alert(`Failed to clear relay: ${err}`);
+      return false;
     }
   }
 
-  async function saveKlipyKey(e: SubmitEvent) {
-    e.preventDefault();
-    if (!klipyKeyInput.trim()) return;
+  async function saveKlipyKey(apiKey: string): Promise<boolean> {
     try {
-      await invoke('save_klipy_key', { apiKey: klipyKeyInput.trim() });
-      klipyApiKey = klipyKeyInput.trim();
+      await invoke('save_klipy_key', { apiKey });
+      klipyApiKey = apiKey;
       klipySaved = true;
-      klipyKeyInput = '';
+      return true;
     } catch (err) {
       alert(err);
+      return false;
     }
   }
 
@@ -1138,25 +519,6 @@ $effect(() => {
       klipySaved = false;
     } catch (err) {
       alert(err);
-    }
-  }
-
-  async function dialPeerViaRelay(e: SubmitEvent) {
-    e.preventDefault();
-    if (!dialAddress.trim()) return;
-    try {
-      await invoke('dial_peer', { address: dialAddress.trim() });
-      alert("Dialing peer...");
-      dialAddress = '';
-    } catch (err) {
-      alert(`Dial failed: ${err}`);
-    }
-  }
-
-  function copyCircuitAddress() {
-    if (myCircuitAddress) {
-      navigator.clipboard.writeText(myCircuitAddress);
-      alert("Circuit address copied to clipboard!");
     }
   }
 
@@ -1204,21 +566,9 @@ $effect(() => {
       if (profile) {
         userNickname = profile.nickname ?? 'Guest';
         userPeerId = profile.peer_id ?? '';
-        nicknameInput = profile.nickname ?? '';
       } else {
         userNickname = 'Guest';
       }
-
-      (async () => {
-        try {
-          if (!(await isPermissionGranted())) {
-            await requestPermission();
-          }
-          notificationsGranted = await isPermissionGranted();
-        } catch {
-          notificationsGranted = false;
-        }
-      })();
 
       const list = await safe('get_allow_list', () => invoke('get_allow_list'));
       allowedPeers = Array.isArray(list) ? list : [];
@@ -1242,11 +592,9 @@ $effect(() => {
       messages = chatOnly;
 
       const savedRelay = await safe('get_relay_endpoint', () => invoke('get_relay_endpoint'));
-      if (savedRelay) {
-        relayPeerId = savedRelay.peer_id ?? '';
-        relayAddress = savedRelay.address ?? '';
-        relaySaved = Boolean(relayPeerId && relayAddress);
-      }
+        if (savedRelay) {
+          relaySaved = Boolean(savedRelay.peer_id && savedRelay.address);
+        }
 
       const relayStatus = await safe('get_relay_status', () => invoke('get_relay_status'));
       if (relayStatus) {
@@ -1290,7 +638,7 @@ $effect(() => {
           });
           if (msg) {
             const info = extractImageInfo(displayBody(msg));
-            resolveImageSrc(info);
+            if (info) resolveImageSrc(info);
           }
         }
       });
@@ -1328,32 +676,37 @@ $effect(() => {
     };
   });
 
-  async function sendMessage(e: SubmitEvent) {
-    e.preventDefault();
-    if (!inputMessage.trim()) return;
+  async function sendMessage(text: string) {
+    const raw = text.trim();
+    if (raw.startsWith('file://')) {
+      replyTo = null;
+      showEmojiPicker = false;
+      for (const line of raw.split(/\r?\n/)) {
+        const path = fileUrlToPath(line.trim());
+        if (path) void shareLocalPathAsFile(path);
+      }
+      return;
+    }
+    if (!raw) return;
     const uid = crypto.randomUUID();
-
-    const rawBody = inputMessage;
-      const outgoingBody = replyTo
-        ? `${REPLY_MARKER}${JSON.stringify({ t: replyTo.key })}\n${rawBody}`
-        : rawBody;
-
+    const rawBody = text;
+    const outgoingBody = replyTo
+      ? `${REPLY_MARKER}${JSON.stringify({ t: replyTo.key })}\n${rawBody}`
+      : rawBody;
     messages = [...messages, { uid, sender_pid: userPeerId, room: activeRoom, sender: userNickname, body: outgoingBody }];
     await invoke('send_chat_message', { message: outgoingBody, uid, room: activeRoom });
-
-    inputMessage = '';
     replyTo = null;
     showEmojiPicker = false;
   }
 
-  async function saveNickname(e: SubmitEvent) {
-    e.preventDefault();
+  async function saveNickname(newName: string): Promise<boolean> {
     try {
-      const updatedProfile = await invoke<{ nickname: string }>('update_nickname', { newName: nicknameInput });
+      const updatedProfile = await invoke<{ nickname: string }>('update_nickname', { newName });
       userNickname = updatedProfile.nickname;
-      editMode = false;
+      return true;
     } catch (err) {
       alert(err);
+      return false;
     }
   }
 
@@ -1377,72 +730,85 @@ $effect(() => {
     }
   }
 
-  function handleManualSubmit(e: SubmitEvent) {
-    e.preventDefault();
-    if (!targetFriendId.trim()) return;
-    acceptPeer(targetFriendId.trim());
-    targetFriendId = '';
-  }
-
   function handlePaste(e: ClipboardEvent) {
-    const items = e.clipboardData?.items;
-    if (items) {
-      for (const item of items) {
-        if (item.type.startsWith('image/')) {
-          e.preventDefault();
-          const file = item.getAsFile();
-          if (file) shareBlobAsFile(file);
-          return;
-        }
-      }
-    }
-    // Some desktops deliver clipboard images as file paths
-    const text = e.clipboardData?.getData?.('text/plain') ?? '';
-    if (text && (text.startsWith('file://') || text.startsWith('/'))) {
-      const path = text.startsWith('file://') ? decodeURIComponent(text.slice(7)) : text;
+    const dt = e.clipboardData;
+    if (!dt) return;
+
+    const items = Array.from(dt.items ?? []);
+    const imageItem = items.find((i) => i.type.startsWith('image/'));
+    const files = Array.from(dt.files ?? []);
+
+    // Image data or any clipboard File object
+    const file = imageItem?.getAsFile() ?? files[0];
+    if (file) {
       e.preventDefault();
-      shareLocalPathAsFile(path);
+      void shareBlobAsFile(file);
       return;
     }
-  }
+
+    // On WebKitGTK neither branch below fires (getData() is broken there),
+    // so no preventDefault → the file:/// URI is pasted into the input
+    // as text natively, and sendMessage routes it on send.
+
+    const uriList = dt.getData('text/uri-list');
+       if (uriList) {
+         const paths = uriList
+           .split(/\r?\n/)
+           .map((l) => l.trim())
+           .filter((l) => l && !l.startsWith('#') && l.startsWith('file://'))
+           .map(fileUrlToPath)
+           .filter((p): p is string => p !== null);
+         if (paths.length > 0) {
+           e.preventDefault();
+           for (const p of paths) void shareLocalPathAsFile(p);
+           return;
+         }
+       }
+
+       // Bare file:// path as plain text (non-WebKitGTK engines)
+       const line = (dt.getData('text/plain') ?? '').trim().split(/\r?\n/)[0] ?? '';
+       if (line.startsWith('file://')) {
+         const path = fileUrlToPath(line);
+         if (path !== null) {
+           e.preventDefault();
+           void shareLocalPathAsFile(path);
+         }
+       }
+     }
 
   async function shareLocalPathAsFile(path: string) {
-    const uid = crypto.randomUUID();
     try {
-      const info = await invoke<FileInfo>('send_file', { path, uid, room: activeRoom });
+      const uid = crypto.randomUUID();
+      const info = await invoke<SharedFileInfo>('send_file', { path, uid, room: activeRoom });
       sentFiles = { ...sentFiles, [uid]: path };
-
-      const marker = isImageFile(info.name) ? IMAGE_MARKER : FILE_MARKER;
-      messages = [...messages, { uid, sender_pid: userPeerId, room: activeRoom, sender: userNickname, body: `${marker}${JSON.stringify(info)}` }];
-
-    } catch (err) { }
-  }
-
-  function selectCircuitAddr(e: MouseEvent) {
-    (e.currentTarget as HTMLTextAreaElement).select();
-  }
-
-  function displayReply(body: string) {
-    const parentKey = replyParentOf(body);
-    if (!parentKey) return { parentKey: null, text: body };
-    const rest = body.slice(body.indexOf('\n') + 1);
-    return { parentKey, text: rest };
+      messages = [...messages, {
+        uid,
+        sender_pid: userPeerId,
+        room: activeRoom,
+        sender: userNickname,
+        body: buildMediaBody(info),
+      }];
+    } catch (err) {
+      console.error('[portsidepeer] file path share failed:', err);
+      alert(`Share failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   async function shareBlobAsFile(file: File) {
     if (!file) return;
     try {
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      const ext = (file.name?.split('.').pop() ?? 'png').toLowerCase();
-      const uid = crypto.randomUUID();
-
-      const path = await invoke<string>('save_temp_media', { data: Array.from(bytes), ext });
-      const info = await invoke('send_file', { path, uid, room: activeRoom });
+      const { uid, path, info } = await shareTempFile(file, activeRoom);
       sentFiles = { ...sentFiles, [uid]: path };
-      messages = [...messages, { uid, sender_pid: userPeerId, room: activeRoom, sender: userNickname, body: `${FILE_MARKER}${JSON.stringify(info)}` }];
+      messages = [...messages, {
+        uid,
+        sender_pid: userPeerId,
+        room: activeRoom,
+        sender: userNickname,
+        body: buildMediaBody(info),
+      }];
     } catch (err) {
       console.error('[portsidepeer] paste share failed:', err);
-      alert(`Share failed: ${err}`);
+      alert(`Share failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -1455,176 +821,47 @@ $effect(() => {
     }
   }
 
+  function openFullReactionPicker(msg: ChatMessage) {
+    reactTarget = { key: messageKey(msg), preview: previewOf(msg, messages) };
+    emojiMode = 'react';
+    reactionPickerFor = null;
+    showEmojiPicker = true;
+  }
+
 </script>
 
 <main class="app-layout">
-  <aside class="sidebar">
-    <div class="sidebar-header">
-      <h2>PortsidePeer settings</h2>
-    </div>
 
-    <div class="sidebar-content">
-      <div class="panel-section">
-        <h4>My Identity Key</h4>
-        <p>Give this to friends so they can whitelist you:</p>
-        <textarea readonly class="id-share-box" value={userPeerId} onclick={(e) => e.currentTarget.select()}></textarea>
-      </div>
-
-      <div class="panel-section">
-        <h4>Circuit Relay</h4>
-
-        {#if relaySaved}
-          <div class="relay-status-box" class:active={relayConnected && relayListening}>
-            <span class="relay-indicator"></span>
-            <span>{relayConnected && relayListening ? 'Relay Connected' : 'Connecting...'}</span>
-            <button onclick={clearRelay} class="clear-relay-btn">Disable</button>
-          </div>
-
-          {#if myCircuitAddress}
-            <textarea readonly class="id-share-box" style="height: 35px; margin-top: 8px; font-size: 10px; color: #94a3b8;" onclick={selectCircuitAddr}>{myCircuitAddress}</textarea>
-            <p class="relay-notice">Click address to select • Share with peers to connect</p>
-          {:else if !relayConnected}
-            <p class="relay-notice">⚠️ Restart required to connect</p>
-          {/if}
-
-        {:else}
-          <form onsubmit={saveRelay} class="sidebar-form">
-            <input bind:value={relayPeerId} placeholder="Relay Peer ID..." autocomplete="off" />
-            <input bind:value={relayAddress} placeholder="/ip4/1.2.3.4/tcp/4001" autocomplete="off" />
-            <button type="submit">Save & Enable Relay</button>
-          </form>
-        {/if}
-      </div>
-
-      <div class="panel-section">
-        <h4>Rooms ({rooms.length})</h4>
-        <div class="room-list">
-          {#each rooms as room (room.id)}
-              <div class="room-row-wrap">
-              <button
-              type="button"
-              class="room-row"
-              class:active={room.id === activeRoom}
-              onclick={() => switchRoom(room.id)}
-            >
-              <span class="hash-tag">#</span>
-              <span class="room-name">{room.name}</span>
-              {#if unreadByRoom[room.id]}
-                <span class="room-badge">{unreadByRoom[room.id]}</span>
-              {/if}
-            </button>
-            <button
-                type="button"
-                class="room-mute-btn"
-                class:muted={mutedRooms[room.id]}
-                title={mutedRooms[room.id] ? 'Unmute room' : 'Mute room'}
-                aria-label={mutedRooms[room.id]
-                    ? `Unmute ${room.name}`
-                    : `Mute ${room.name}`}
-                onclick={() => toggleRoomMute(room.id)}
-                >{mutedRooms[room.id] ? '🔕' : '🔔'}</button>
-              </div>
-          {/each}
-        </div>
-        {#if showNewRoom}
-          <form onsubmit={createRoom} class="sidebar-form" style="margin-top: 8px;">
-            <input bind:value={newRoomInput} placeholder="Add new room!" autocomplete="off" />
-            <button type="submit">Create</button>
-          </form>
-        {:else}
-          <button type="button" class="add-room-btn" onclick={() => (showNewRoom = true)}>+ Add Room</button>
-        {/if}
-      </div>
-
-      <div class="panel-section">
-        <h4>Notifications</h4>
-        <button
-          type="button"
-          class="notif-toggle-row"
-          onclick={toggleNotifications}
-        >
-          <span class="notif-toggle-label">{notificationsEnabled ? '🔔 Enabled' : '🔕 Muted'}</span>
-          <span class="notif-toggle-track" class:on={notificationsEnabled}>
-            <span class="notif-toggle-thumb"></span>
-          </span>
-        </button>
-      </div>
-
-      <div class="panel-section">
-        <h4>GIF Search</h4>
-        {#if klipySaved}
-          <div class="relay-status-box active">
-            <span class="relay-indicator"></span>
-            <span>Klipy key configured</span>
-            <button onclick={clearKlipyKey} class="clear-relay-btn">Clear</button>
-          </div>
-        {:else}
-          <form onsubmit={saveKlipyKey} class="sidebar-form">
-            <input bind:value={klipyKeyInput} placeholder="Klipy API key..." autocomplete="off" />
-            <button type="submit">Save Key</button>
-          </form>
-        {/if}
-      </div>
-
-      {#if discoveredPeers.length > 0}
-        <div class="panel-section discovery-alert-zone">
-          <h4 class="pulse-text">⚡ Nearby Peer Found!</h4>
-          {#each discoveredPeers as peer}
-            <div class="discovery-card">
-              <span class="disc-id">ID: {shortPeer(peer, 10)}</span>
-              <button onclick={() => acceptPeer(peer)} class="accept-invite-btn">Connect</button>
-            </div>
-          {/each}
-        </div>
-      {/if}
-
-      <div class="panel-section">
-        <h4>Manual Authorization</h4>
-        <form onsubmit={handleManualSubmit} class="sidebar-form">
-          <input bind:value={targetFriendId} placeholder="Paste friend's PeerID..." autocomplete="off" />
-          <button type="submit">Grant Entry</button>
-        </form>
-      </div>
-
-      <div class="panel-section allowed-list-box">
-        <h4>Allowed Friends ({allowedPeers.length})</h4>
-        <div class="allowed-scroll">
-          {#if allowedPeers.length === 0}
-            <span class="empty-notice">Waiting for automatic detection...</span>
-          {/if}
-          {#each allowedPeers as peer}
-            <div class="peer-row" title={peer}>
-              <span class="key-icon">🔑</span>
-              <span class="peer-id-text">{shortPeer(peer, 12)}</span>
-              <button onclick={() => revokeAccess(peer)} class="revoke-btn" title="Revoke access and block peer">✕</button>
-            </div>
-          {/each}
-        </div>
-      </div>
-    </div>
-
-    <div class="profile-drawer">
-      {#if !editMode}
-        <div class="profile-view">
-            {#if avatars[userPeerId]}
-                <img class="avatar-img" src={avatars[userPeerId]} alt="" />
-            {:else}
-            <span class="profile-name" title={userPeerId}>🌐 {userNickname}</span>
-            {/if}
-           <button onclick={pickAvatar} class="edit-btn">Avatar</button>
-           <button onclick={() => editMode = true} class="edit-btn">Edit</button>
-        </div>
-      {:else}
-        <form onsubmit={saveNickname} class="profile-edit">
-          <input bind:value={nicknameInput} placeholder="Change name..." class="edit-input" />
-          <div class="edit-actions">
-            <button type="submit" class="save-btn">✓</button>
-            <button type="button" onclick={() => editMode = false} class="cancel-btn">✕</button>
-          </div>
-        </form>
-      {/if}
-    </div>
-  </aside>
+    <RoomSidebar
+      userPeerId={userPeerId}
+      userNickname={userNickname}
+      myAvatar={avatars[userPeerId] ?? null}
+      relaySaved={relaySaved}
+      relayConnected={relayConnected}
+      relayListening={relayListening}
+      myCircuitAddress={myCircuitAddress}
+      rooms={rooms}
+      activeRoom={activeRoom}
+      unreadByRoom={unreadByRoom}
+      mutedRooms={mutedRooms}
+      notificationsEnabled={notificationsEnabled}
+      klipySaved={klipySaved}
+      discoveredPeers={discoveredPeers}
+      allowedPeers={allowedPeers}
+      onSwitchRoom={switchRoom}
+      onToggleRoomMute={toggleRoomMute}
+      onToggleNotifications={toggleNotifications}
+      onDisableRelay={clearRelay}
+      onClearKlipyKey={clearKlipyKey}
+      onAcceptPeer={acceptPeer}
+      onRevokePeer={revokeAccess}
+      onPickAvatar={pickAvatar}
+      onSaveRelay={saveRelay}
+      onSaveKlipyKey={saveKlipyKey}
+      onGrantPeer={acceptPeer}
+      onRenameProfile={saveNickname}
+      onCreateRoom={createRoom}
+    />
 
   <section class="main-workspace">
     <header class="app-header">
@@ -1667,368 +904,51 @@ $effect(() => {
             </div>
           {/if}
           {#each visibleMessages as msg}
-            {@const body = displayBody(msg)}
-            {@const gifUrl = extractGifUrl(body)}
-            {@const imgUrl = extractImageUrl(body)}
-            {@const fileInfo = extractFileInfo(body)}
-            {@const isMine = senderName(msg) === userNickname}
-            {@const mKey = messageKey(msg)}
-            {@const replyInfo = displayReply(body)}
-            {@const imageInfo = extractImageInfo(body)}
-            <div class="message-card" id={`msg-${mKey}`}>
-                {#if avatarFor(msg)}
-                    <img class="avatar-img" src={avatarFor(msg)} alt="" />
-                {:else}
-                    <div class="avatar-mock">{senderInitials(msg)}</div>
-                {/if}
-              <div class="message-content">
-                <span class="user-badge" class:self-user={isMine}>{senderName(msg)}</span>
-
-                {#if gifUrl}
-                    {#if failedMediaUrls.includes(gifUrl)}
-                        <a class="gif-fallback-link" href={gifUrl} target="_blank" rel="noopener noreferrer" title={gifUrl}>
-                          GIF unavailable in-app — click to open in browser
-                        </a>
-                      {:else}
-                        <div class="gif-media-frame">
-                          <img
-                            src={gifUrl}
-                            alt={`GIF from ${senderName(msg)}`}
-                            loading="lazy"
-                            onerror={() => handleMediaError(gifUrl)}
-                          />
-                        </div>
-                      {/if}
-                {:else if imgUrl}
-                        {#if failedMediaUrls.includes(imgUrl)}
-                        <a class="gif-fallback-link" href={imgUrl} target="_blank" rel="noopener noreferrer" title={imgUrl}>
-                            Image unavailable in-app — click to open in browser
-                        </a>
-                        {:else}
-                        <div class="gif-media-frame">
-                            <img
-                            src={imgUrl}
-                            alt={`Image from ${senderName(msg)}`}
-                            loading="lazy"
-                            onerror={() => handleMediaError(imgUrl)}
-                            />
-                        </div>
-                        {/if}
-                        {:else if imageInfo}
-                            {@const src = imageSrcs[imageInfo.id]}
-                            {#if src}
-                                <div class="gif-media-frame">
-                                    <img
-                                        src={src}
-                                        alt={`Image from ${senderName(msg)}`}
-                                        onerror={() => handleMediaError(src)}
-                                    />
-                                </div>
-                            {:else if fileProgress[imageInfo.id]}
-                                <div class="file-card">
-                                    <span class="file-icon">🖼️</span>
-                                    <div class="file-details">
-                                        <span class="file-name" title={imageInfo.name}>{imageInfo.name}</span>
-                                        <span class="file-size">
-                                            {Math.round((fileProgress[imageInfo.id].received / Math.max(fileProgress[imageInfo.id].total, 1)) * 100)}%
-                                        </span>
-                                    </div>
-                                </div>
-                            {:else if sentFiles[imageInfo.id] || receivedFiles[imageInfo.id]}
-                                <span class="file-progress-label">Loading image…</span>
-                            {:else}
-                                <div class="file-card">
-                                    <span class="file-icon">🖼️</span>
-                                    <div class="file-details">
-                                        <span class="file-name" title={imageInfo.name}>{imageInfo.name}</span>
-                                        <span class="file-size">{imageInfo.size ? formatBytes(imageInfo.size) : ''}</span>
-                                    </div>
-                                    <span class="file-progress-label">Not downloaded</span>
-                                </div>
-                            {/if}
-                  {:else if fileInfo}
-                    <div class="file-card">
-                      <span class="file-icon">📄</span>
-                      <div class="file-details">
-                        <span class="file-name" title={fileInfo.name}>{fileInfo.name}</span>
-                        <span class="file-size">{formatBytes(fileInfo.size)}</span>
-                      </div>
-                      {#if sentFiles[fileInfo.id] || receivedFiles[fileInfo.id]}
-                        <button type="button" class="file-open-btn" onclick={() => openSharedFile(fileInfo)}>Open</button>
-                      {:else if fileProgress[fileInfo.id]}
-                        <span class="file-progress-label">
-                          {Math.round((fileProgress[fileInfo.id].received / Math.max(fileProgress[fileInfo.id].total, 1)) * 100)}%
-                        </span>
-                      {:else}
-                        <span class="file-progress-label">Not downloaded</span>
-                      {/if}
-                    </div>
-                  {:else}
-                    {#if replyInfo.parentKey}
-                      {@const parent = messageByKey(replyInfo.parentKey)}
-                      {#if parent}
-                        <button
-                          type="button"
-                          class="reply-quote"
-                          onclick={() => {
-                            document.getElementById(`msg-${replyInfo.parentKey}`)?.scrollIntoView({
-                              behavior: 'smooth', block: 'center'
-                            });
-                          }}
-                        >
-                          <span class="reply-quote-bar" aria-hidden="true"></span>
-                          <span class="reply-quote-sender">{senderName(parent)}</span>
-                          <span class="reply-quote-text">{replyPreviewOf(parent)}</span>
-                        </button>
-                      {:else}
-                        <span class="reply-quote reply-quote-ghost">
-                          <span class="reply-quote-bar" aria-hidden="true"></span>
-                          <span class="reply-quote-sender">Original message</span>
-                          <span class="reply-quote-text">not available on this device</span>
-                        </span>
-                      {/if}
-                    {/if}
-                    <p class="msg-body">{replyInfo.text}</p>
-                    {/if}
-                {#if reactions[mKey]}
-                  <div class="reaction-row">
-                    {#each Object.entries(reactions[mKey]) as [emoji, users] (emoji)}
-                      <button
-                        type="button"
-                        class="reaction-pill"
-                        class:mine={users.some((u) => u.p === me().p)}
-                        title={users.map((u) => u.n).join(', ')}
-                        onclick={() => {pushRecentEmoji(emoji); toggleReaction(mKey, emoji)}}
-                      >
-                        <span>{emoji}</span><span class="reaction-count">{users.length}</span>
-                      </button>
-                    {/each}
-                  </div>
-                {/if}
-              </div>
-
-              <div class="reaction-add-wrap">
-                <button
-                  type="button"
-                  class="reaction-add-btn"
-                  aria-label="Add reaction"
-                  onclick={(e) => {
-                    e.stopPropagation();
-                    if (reactionPickerFor === mKey) {
-                      reactionPickerFor = null;
-                    } else {
-                      const card = document.getElementById(`msg-${mKey}`);
-                      const log = messageLogEl;
-                      if (card && log) {
-                        const cardTop = card.getBoundingClientRect().top;
-                        const logBottom = log.getBoundingClientRect().bottom;
-                        reactionPickerFlip = cardTop > logBottom - 140;
-                      }
-                      reactionPickerFor = mKey;
-                    }
-                  }}
-                >🙂</button>
-                <button
-                    type="button"
-                    class="reaction-add-btn"
-                    aria-label="Reply to message"
-                    onclick={() => startReply(msg)}
-                  >↩️</button>
-                </div>
-
-                {#if reactionPickerFor === mKey}
-                  <div class="reaction-quick-bar"
-                    class:flip-up={reactionPickerFlip}
-                    use:clickOutside={() => (reactionPickerFor = null)}
-                  >
-                    {#if recentEmoji.length > 0}
-                        <div class="quick-bar-recent">
-                            {#each recentEmoji.slice(0, 5) as emoji (emoji)}
-                            <button
-                                type="button"
-                                class="reaction-quick-emoji"
-                                onclick={() => { pushRecentEmoji(emoji); toggleReaction(mKey, emoji); reactionPickerFor = null; }}
-                            >{emoji}</button>
-                            {/each}
-                        </div>
-                        <span class="quick-bar-divider" aria-hidden="true"></span>
-                    {/if}
-                    {#each QUICK_REACTIONS as emoji}
-                      <button
-                        type="button"
-                        class="reaction-quick-emoji"
-                        onclick={() => { pushRecentEmoji(emoji); toggleReaction(mKey, emoji); reactionPickerFor = null; }}
-                      >{emoji}</button>
-                    {/each}
-                    <button
-                      type="button"
-                      class="reaction-quick-emoji reaction-more-btn"
-                      title="More reactions"
-                      onclick={(e) => { e.stopPropagation(); openFullReactionPicker(msg); }}
-                    >⋯</button>
-                  </div>
-                {/if}
-            </div>
+              <MessageItem
+                  {msg}
+                  {messages}
+                  {userNickname}
+                  {userPeerId}
+                  {avatars}
+                  {reactions}
+                  {imageSrcs}
+                  {fileProgress}
+                  {sentFiles}
+                  {receivedFiles}
+                  {failedMediaUrls}
+                  {recentEmoji}
+                  {reactionPickerFor}
+                  {reactionPickerFlip}
+                  {messageLogEl}
+                  onPickerFor={(k) => (reactionPickerFor = k)}
+                  onPickerFlip={(b) => (reactionPickerFlip = b)}
+                  onReply={startReply}
+                  onToggleReaction={toggleReaction}
+                  onPushRecentEmoji={pushRecentEmoji}
+                  onOpenSharedFile={openSharedFile}
+                  onMediaError={handleMediaError}
+                  onOpenFullPicker={openFullReactionPicker}
+                />
           {/each}
         </div>
       </div>
 
-      {#if showGifPanel}
-        <div class="gif-search-drawer">
-          <div class="drawer-header">
-            <input
-              bind:value={gifSearchQuery}
-              oninput={searchGifs}
-              placeholder="Search Giphy for an expression..."
-              autocomplete="off"
-            />
-            <button onclick={() => showGifPanel = false} class="close-drawer-btn">✕</button>
-          </div>
-
-          <div class="gif-results-grid">
-            {#if !klipyApiKey}
-                <span class="gif-notice">GIF search needs a Klipy API key — add one under GIF Search in the sidebar</span>
-              {:else if isSearchingGifs}
-                <span class="gif-notice">Querying decentralized rooms...</span>
-              {:else if searchResults.length === 0}
-                <span class="gif-notice">Type something to load matching expressions...</span>
-            {/if}
-            {#each searchResults as gif}
-              {@const tileUrl = gifTileUrl(gif)}
-              {#if tileUrl}
-                <button onclick={() => shareGif(tileUrl)} class="gif-tile-btn">
-                  <img src={tileUrl} alt={gif.title || "Klipy GIF"} loading="lazy" />
-                </button>
-              {/if}
-            {/each}
-          </div>
-        </div>
-      {/if}
-
-      <div class="portsidepeer-composer-container">
-          {#if showEmojiPicker}
-            <div class="emoji-picker-popover" use:clickOutside={closeEmojiPicker}>
-              <div class="emoji-search-bar">
-                <input bind:value={emojiSearchQuery} placeholder="Search emoji…" autocomplete="off" />
-
-                {#if emojiSearchQuery}
-                  <button type="button" class="emoji-search-clear" onclick={() => (emojiSearchQuery = '')}>✕</button>
-                {/if}
-              </div>
-
-              {#if emojiMode === 'react'}
-                <div class="emoji-react-banner">
-                  <strong>Reacting</strong>
-                  <span class="emoji-react-preview" title={reactTarget?.preview}>
-                    {reactTarget?.preview?.slice(0, 60) ?? ''}
-                  </span>
-                </div>
-              {/if}
-
-              {#if !emojiSearchResults && recentEmoji.length > 0}
-                <div class="emoji-recents-row">
-                    <span class="emoji-recents-label">Recent</span>
-                    <div class="emoji-recents-grid">
-                        {#each recentEmoji as emoji (emoji)}
-                          <button
-                            type="button"
-                            class="emoji-cell emoji-recent-cell"
-                            onclick={() => pickEmoji(emoji)}
-                          >{emoji}</button>
-                        {/each}
-                    </div>
-                </div>
-              {/if}
-
-              {#if emojiSearchResults}
-                <div class="emoji-grid">
-                  {#if emojiSearchResults.length === 0}
-                    <span class="emoji-empty">No emoji match “{emojiSearchQuery}”</span>
-                  {/if}
-                  {#each emojiSearchResults as { emoji } (emoji)}
-                    <button type="button" class="emoji-cell" onclick={() => pickEmoji(emoji)}>{emoji}</button>
-                  {/each}
-                </div>
-              {:else}
-                <div class="emoji-category-tabs">
-                  {#each EMOJI_CATEGORIES as cat, idx}
-                    <button
-                      type="button"
-                      class="emoji-tab"
-                      class:active={activeEmojiCategory === idx}
-                      title={cat.name}
-                      onclick={() => (activeEmojiCategory = idx)}
-                    >{cat.icon}</button>
-                  {/each}
-                </div>
-                <div class="emoji-grid">
-                  {#each (EMOJI_CATEGORIES[activeEmojiCategory] ?? EMOJI_CATEGORIES[0]).emojis as emoji}
-                    <button type="button" class="emoji-cell" onclick={() => pickEmoji(emoji)}>{emoji}</button>
-                  {/each}
-                </div>
-              {/if}
-            </div>
-          {/if}
-
-          {#if replyTo}
-            <div class="reply-composer-bar">
-              <span class="reply-quote-bar" aria-hidden="true"></span>
-              <div class="reply-composer-info">
-                <span class="reply-composer-label">Replying to <strong>{replyTo.name}</strong></span>
-                <span class="reply-composer-preview">{replyTo.preview}</span>
-              </div>
-              <button type="button" class="reply-cancel-btn" onclick={cancelReply} aria-label="Cancel reply">✕</button>
-            </div>
-          {/if}
-
-        <form onsubmit={sendMessage} class="portsidepeer-input-capsule">
-
-            <button
-              type="button"
-              class="portsidepeer-action-btn attach-btn"
-              aria-label="Upload file"
-              onclick={attachFile}
-            >
-              ➕
-            </button>
-
-          <input
-            bind:this={composerInputEl}
-            bind:value={inputMessage}
-            placeholder="Message #sbb-lounge"
-            autocomplete="off"
-            class="portsidepeer-text-field"
-          />
-
-          <div class="portsidepeer-actions-group">
-            <button
-              type="button"
-              class="portsidepeer-action-btn gif-btn"
-              onclick={() => showGifPanel = !showGifPanel}
-              aria-label="Toggle GIF panel"
-            >
-              GIF
-            </button>
-
-            <button
-              type="button"
-              class="portsidepeer-action-btn emoji-btn"
-              onclick={(e) => {
-                e.stopPropagation();
-                emojiMode = 'compose';
-                reactTarget = null;
-                reactionPickerFor = null;
-                showEmojiPicker = !showEmojiPicker;
-              }}
-              aria-label="Toggle emoji picker"
-            >
-              😀
-            </button>
-          </div>
-
-          <button type="submit" class="portsidepeer-send-btn">Send</button>
-        </form>
-      </div>
+      <Composer
+        bind:showEmojiPicker
+        bind:emojiMode
+        bind:reactTarget
+        {replyTo}
+        {klipyApiKey}
+        {recentEmoji}
+        onSend={sendMessage}
+        onAttach={attachFile}
+        onShareGif={shareGif}
+        onCancelReply={cancelReply}
+        onPushRecentEmoji={pushRecentEmoji}
+        onToggleReaction={toggleReaction}
+        onCloseReactionPicker={() => (reactionPickerFor = null)}
+        bind:this={composer}
+      />
     </div>
   </section>
 </main>
@@ -2044,262 +964,8 @@ $effect(() => {
     overflow: hidden;
   }
 
-  .sidebar {
-    width: 280px;
-    min-width: 280px;
-    background: #0f1115;
-    display: flex;
-    flex-direction: column;
-    height: 100%;
-    box-sizing: border-box;
-    border-right: 1px solid #1f232b;
-  }
-
-  .sidebar-header {
-    height: 48px;
-    padding: 0 16px;
-    display: flex;
-    align-items: center;
-    border-bottom: 1px solid #1f232b;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.4);
-  }
-
-  .sidebar-header h2 {
-    margin: 0;
-    font-size: 14px;
-    color: #e2e8f0;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-  }
-
-  .sidebar-content {
-    flex-grow: 1;
-    padding: 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 20px;
-    overflow-y: auto;
-  }
-
-  .panel-section h4 {
-    margin: 0 0 8px 0;
-    font-size: 11px;
-    text-transform: uppercase;
-    color: #475569;
-    letter-spacing: 0.5px;
-  }
-
-  .id-share-box {
-    width: 100%;
-    height: 50px;
-    background: #090d16;
-    border: 1px solid #1f232b;
-    border-radius: 4px;
-    color: #10b981;
-    font-family: monospace;
-    font-size: 11px;
-    padding: 8px;
-    resize: none;
-    box-sizing: border-box;
-    outline: none;
-  }
-
-  .discovery-alert-zone {
-    background: rgba(16, 185, 129, 0.05);
-    border: 1px dashed #10b981;
-    padding: 12px;
-    border-radius: 4px;
-  }
-
-  .pulse-text {
-    color: #10b981 !important;
-    font-weight: 700;
-    animation: blinker 2s linear infinite;
-  }
-
   @keyframes blinker {
     50% { opacity: 0.4; }
-  }
-
-  .discovery-card {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-top: 8px;
-    background: #090d16;
-    padding: 8px;
-    border-radius: 4px;
-    border: 1px solid #1f232b;
-  }
-
-  .disc-id {
-    font-family: monospace;
-    font-size: 11px;
-    color: #e2e8f0;
-  }
-
-  .accept-invite-btn {
-    background: #10b981;
-    border: none;
-    color: #090d16;
-    font-size: 11px;
-    padding: 4px 10px;
-    border-radius: 4px;
-    font-weight: 700;
-    cursor: pointer;
-    transition: background-color 0.15s ease;
-  }
-
-  .accept-invite-btn:hover {
-    background: #059669;
-  }
-
-  .sidebar-form {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-
-  .sidebar-form input {
-    background: #090d16;
-    border: 1px solid #1f232b;
-    padding: 10px;
-    color: #e2e8f0;
-    border-radius: 4px;
-    outline: none;
-    font-size: 13px;
-  }
-
-  .sidebar-form input::placeholder {
-    color: #475569;
-  }
-
-  .sidebar-form button {
-    background: #1f232b;
-    border: 1px solid #334155;
-    color: #e2e8f0;
-    padding: 10px;
-    border-radius: 4px;
-    font-weight: 600;
-    cursor: pointer;
-    font-size: 13px;
-    transition: all 0.15s ease;
-  }
-
-  .sidebar-form button:hover {
-    background: #334155;
-    border-color: #10b981;
-  }
-
-  .allowed-list-box {
-    flex-grow: 1;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-    min-height: 150px;
-  }
-
-  .allowed-scroll {
-    flex-grow: 1;
-    overflow-y: auto;
-    background: #090d16;
-    border: 1px solid #1f232b;
-    border-radius: 4px;
-    padding: 8px;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
-
-  .peer-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 4px;
-  }
-
-  .peer-id-text {
-    flex-grow: 1;
-    font-family: monospace;
-    font-size: 12px;
-    color: #94a3b8;
-  }
-
-  .revoke-btn {
-    background: transparent;
-    border: none;
-    color: #475569;
-    font-size: 11px;
-    cursor: pointer;
-    padding: 2px 6px;
-    border-radius: 4px;
-    font-weight: bold;
-    transition: all 0.15s ease;
-  }
-
-  .revoke-btn:hover {
-    color: #ffffff;
-    background-color: #ef4444;
-  }
-
-  .key-icon {
-    margin-right: 6px;
-    filter: sepia(100%) hue-rotate(90deg) saturate(300%);
-  }
-
-  .empty-notice {
-    font-size: 11px;
-    color: #475569;
-    text-align: center;
-    font-style: italic;
-    margin-top: 15px;
-    line-height: 1.4;
-  }
-
-  .profile-drawer {
-    background: #090d16;
-    padding: 12px 16px;
-    height: 52px;
-    box-sizing: border-box;
-    display: flex;
-    align-items: center;
-    border-top: 1px solid #1f232b;
-  }
-
-  .profile-view {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    width: 100%;
-  }
-
-  .profile-name {
-    font-weight: 600;
-    color: #e2e8f0;
-    font-size: 14px;
-  }
-
-  .edit-btn {
-    background: #1f232b;
-    border: 1px solid #334155;
-    color: #e2e8f0;
-    padding: 4px 10px;
-    border-radius: 4px;
-    cursor: pointer;
-    font-size: 12px;
-    transition: border-color 0.15s ease;
-  }
-
-  .edit-btn:hover {
-    border-color: #10b981;
-  }
-
-  .profile-edit {
-    display: flex;
-    gap: 6px;
-    width: 100%;
-    align-items: center;
   }
 
   .edit-input {
@@ -2311,11 +977,6 @@ $effect(() => {
     outline: none;
     flex-grow: 1;
     font-size: 13px;
-  }
-
-  .edit-actions {
-    display: flex;
-    gap: 4px;
   }
 
   .save-btn {
@@ -2425,670 +1086,6 @@ $effect(() => {
     color: #475569;
   }
 
-  .message-card {
-    display: flex;
-    gap: 16px;
-    align-items: flex-start;
-    padding: 4px 0;
-    position: relative;
-  }
-
-  .avatar-mock {
-    width: 52px;
-    height: 52px;
-    border-radius: 50%;
-    background: #1f232b;
-    border: 1px solid #334155;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: #10b981;
-    font-weight: bold;
-    font-size: 16px;
-    flex-shrink: 0;
-  }
-
-  .message-content {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-
-  .user-badge {
-    color: #e2e8f0;
-    font-weight: 600;
-    font-size: 15px;
-  }
-
-  .user-badge.self-user {
-    color: #10b981;
-  }
-
-  .msg-body {
-    margin: 0;
-    color: #94a3b8;
-    word-break: break-word;
-    font-size: 15px;
-    line-height: 1.5;
-  }
-
-  .gif-search-drawer {
-    background: #2b2d31;
-    border: 1px solid #1f2023;
-    border-radius: 8px;
-    margin-bottom: 12px;
-    display: flex;
-    flex-direction: column;
-    height: 320px;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-    z-index: 100;
-    flex-shrink: 0;
-  }
-  .drawer-header {
-    display: flex;
-    padding: 10px;
-    gap: 10px;
-    border-bottom: 1px solid #1f2023;
-  }
-  .drawer-header input {
-    flex-grow: 1;
-    background: #1e1f22;
-    border: none;
-    padding: 10px;
-    color: white;
-    border-radius: 4px;
-    outline: none;
-    font-size: 14px;
-  }
-  .close-drawer-btn {
-    background: transparent;
-    border: none;
-    color: #949ba4;
-    font-size: 16px;
-    cursor: pointer;
-  }
-  .close-drawer-btn:hover { color: #f2f3f5; }
-
-  .gif-results-grid {
-    flex-grow: 1;
-    overflow-y: auto;
-    padding: 10px;
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 8px;
-    align-content: start;
-  }
-  .gif-tile-btn {
-    background: #1e1f22;
-    border: none;
-    padding: 0;
-    margin: 0;
-    cursor: pointer;
-    border-radius: 4px;
-    overflow: hidden;
-    height: 90px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-  .gif-tile-btn img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    transition: transform 0.2s ease;
-  }
-  .gif-tile-btn:hover img { transform: scale(1.05); }
-  .gif-notice {
-    grid-column: span 3;
-    text-align: center;
-    color: #949ba4;
-    font-size: 13px;
-    margin-top: 40px;
-    font-style: italic;
-  }
-
-  .gif-media-frame {
-    margin-top: 4px;
-    width: 280px;
-    height: 210px;
-    border-radius: 6px;
-    overflow: hidden;
-    background-color: #1e1f22;
-    display: flex;
-    flex-shrink: 0;
-  }
-  .gif-media-frame img {
-    width: 100%;
-    height: 100%;
-    object-fit: contain;
-  }
-
-  .gif-fallback-link {
-    display: inline-block;
-    margin-top: 4px;
-    max-width: 280px;
-    color: #10b981;
-    font-size: 13px;
-    text-decoration: underline;
-    word-break: break-all;
-  }
-
-  .gif-fallback-link:hover {
-    color: #34d399;
-  }
-
-  .portsidepeer-composer-container {
-    position: relative;
-    width: 100%;
-    padding: 0 16px 24px 16px;
-    box-sizing: border-box;
-  }
-
-  .portsidepeer-input-capsule {
-    display: flex;
-    align-items: center;
-    background-color: #0f1115;
-    border: 1px solid #1f232b;
-    border-radius: 4px;
-    padding: 10px 16px;
-    gap: 12px;
-    width: 100%;
-    box-sizing: border-box;
-  }
-
-  .portsidepeer-text-field {
-    flex: 1;
-    background: transparent;
-    border: none;
-    outline: none;
-    color: #e2e8f0;
-    font-size: 1rem;
-    font-family: inherit;
-    padding: 0;
-  }
-
-  .portsidepeer-text-field::placeholder {
-    color: #475569;
-  }
-
-  .portsidepeer-actions-group {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .portsidepeer-action-btn {
-    background: transparent;
-    border: none;
-    cursor: pointer;
-    padding: 4px;
-    font-size: 1.3rem;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    filter: grayscale(100%) brightness(0.7);
-    transition: filter 0.15s ease, transform 0.1s ease;
-  }
-
-  .portsidepeer-action-btn:hover {
-    filter: grayscale(0%) brightness(1);
-    transform: scale(1.05);
-  }
-
-  .portsidepeer-action-btn.gif-btn {
-    background-color: #1f232b;
-    color: #94a3b8;
-    font-size: 0.75rem;
-    font-weight: 700;
-    padding: 3px 6px;
-    border-radius: 4px;
-    filter: none;
-  }
-
-  .portsidepeer-action-btn.gif-btn:hover {
-    background-color: #334155;
-    color: #10b981;
-  }
-
-  .portsidepeer-send-btn {
-    background-color: #10b981;
-    color: #090d16;
-    border: none;
-    padding: 6px 14px;
-    border-radius: 4px;
-    font-weight: 600;
-    cursor: pointer;
-    font-size: 0.85rem;
-    transition: background-color 0.15s ease, transform 0.1s ease;
-  }
-
-  .portsidepeer-send-btn:hover {
-    background-color: #059669;
-  }
-
-  .emoji-picker-popover {
-    position: absolute;
-    bottom: 100%;
-    right: 32px;
-    z-index: 1000;
-    margin-bottom: 8px;
-    width: 328px;
-    height: 340px;
-    background: #0f1115;
-    border: 1px solid #1f232b;
-    border-radius: 4px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-  }
-
-  .emoji-category-tabs {
-    display: flex;
-    background: #090d16;
-    border-bottom: 1px solid #1f232b;
-    flex-shrink: 0;
-  }
-
-  .emoji-tab {
-    flex: 1;
-    background: transparent;
-    border: none;
-    border-bottom: 2px solid transparent;
-    padding: 7px 0 5px 0;
-    font-size: 15px;
-    cursor: pointer;
-    filter: grayscale(100%) brightness(0.8);
-    transition: filter 0.15s ease, border-color 0.15s ease, background-color 0.15s ease;
-  }
-
-  .emoji-tab:hover {
-    filter: none;
-  }
-
-  .emoji-tab.active {
-    filter: none;
-    border-bottom-color: #10b981;
-    background: #0f1115;
-  }
-
-  .emoji-grid {
-    flex-grow: 1;
-    overflow-y: auto;
-    padding: 8px;
-    display: grid;
-    grid-template-columns: repeat(8, 1fr);
-    gap: 2px;
-    align-content: start;
-  }
-
-  .emoji-cell {
-    background: transparent;
-    border: none;
-    border-radius: 4px;
-    font-size: 20px;
-    line-height: 1.4;
-    padding: 3px 0;
-    cursor: pointer;
-    transition: background-color 0.1s ease, transform 0.1s ease;
-  }
-
-  .emoji-cell:hover {
-    background: #1f232b;
-    transform: scale(1.2);
-  }
-
-  .quick-bar-recent {
-    display: flex;
-    gap: 2px;
-  }
-
-  .quick-bar-divider {
-    width: 1px;
-    align-self: stretch;
-    background: #1f232b;
-    margin: 2px 3px;
-  }
-
-  .emoji-recents-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 10px 6px 12px;
-    background: #090d16;
-    border-bottom: 1px solid #1f232b;
-    flex-shrink: 0;
-  }
-
-  .emoji-recents-label {
-    font-size: 10px;
-    text-transform: uppercase;
-    color: #475569;
-    letter-spacing: 0.5px;
-    flex-shrink: 0;
-  }
-
-  .emoji-recents-grid {
-    display: flex;
-    gap: 2px;
-    overflow-x: auto;
-    flex: 1;
-  }
-
-  .emoji-recent-cell {
-    font-size: 17px;
-    padding: 2px 0;
-  }
-
-  .emoji-recent-cell:hover {
-    background: #1f232b;
-    transform: scale(1.2);
-  }
-
-  .relay-status-box {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    background: #090d16;
-    border: 1px solid #1f232b;
-    padding: 8px 10px;
-    border-radius: 4px;
-    font-size: 12px;
-    color: #94a3b8;
-    font-weight: 600;
-  }
-
-  .relay-status-box.active {
-    border-color: #10b981;
-    color: #10b981;
-  }
-
-  .relay-indicator {
-    width: 8px;
-    height: 8px;
-    background-color: #10b981;
-    border-radius: 50%;
-    box-shadow: 0 0 6px #10b981;
-    animation: blinker 2s linear infinite;
-  }
-
-  .clear-relay-btn {
-    margin-left: auto;
-    background: transparent;
-    border: 1px solid #475569;
-    color: #94a3b8;
-    font-size: 10px;
-    padding: 2px 8px;
-    border-radius: 4px;
-    cursor: pointer;
-    transition: all 0.15s ease;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-  }
-
-  .clear-relay-btn:hover {
-    border-color: #ef4444;
-    color: #ef4444;
-  }
-
-  .relay-notice {
-    margin: 8px 0 0 0;
-    font-size: 10px;
-    color: #f59e0b;
-    font-style: italic;
-    text-align: center;
-  }
-
-  .reaction-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-    margin-top: 4px;
-  }
-
-  .reaction-pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    background: #0f1115;
-    border: 1px solid #1f232b;
-    border-radius: 6px;
-    padding: 1px 8px;
-    cursor: pointer;
-    font-size: 13px;
-    color: #94a3b8;
-    transition: border-color 0.15s ease, background-color 0.15s ease;
-  }
-
-  .reaction-pill:hover {
-    border-color: #334155;
-    background: #1f232b;
-  }
-
-  .reaction-pill.mine {
-    background: rgba(16, 185, 129, 0.12);
-    border-color: #10b981;
-    color: #10b981;
-  }
-
-  .reaction-count {
-    font-size: 11px;
-    font-weight: 700;
-  }
-
-  .reaction-add-wrap {
-    position: absolute;
-    top: 2px;
-    right: 4px;
-    z-index: 20;
-  }
-
-  .reaction-add-btn {
-    background: #0f1115;
-    border: 1px solid #1f232b;
-    border-radius: 6px;
-    color: #94a3b8;
-    font-size: 13px;
-    padding: 2px 7px;
-    cursor: pointer;
-    opacity: 0;
-    transition: opacity 0.15s ease, border-color 0.15s ease;
-  }
-
-  .message-card:hover .reaction-add-btn {
-    opacity: 1;
-  }
-
-  .reaction-add-btn:hover {
-    border-color: #10b981;
-    color: #10b981;
-  }
-
-  .reaction-quick-bar {
-    position: absolute;
-    top: calc(100% + 4px);
-    right: 28px;
-    z-index: 1100;
-    display: flex;
-    gap: 2px;
-    padding: 4px;
-    background: #0f1115;
-    border: 1px solid #1f232b;
-    border-radius: 6px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
-  }
-
-  .reaction-quick-bar.flip-up {
-    top: auto;
-    bottom: calc(100% + 4px);
-  }
-
-  .reaction-quick-emoji {
-    background: transparent;
-    border: none;
-    border-radius: 4px;
-    font-size: 18px;
-    padding: 2px 4px;
-    cursor: pointer;
-    transition: background-color 0.1s ease, transform 0.1s ease;
-  }
-
-  .reaction-quick-emoji:hover {
-    background: #1f232b;
-    transform: scale(1.15);
-  }
-
-  .reaction-more-btn {
-    color: #94a3b8;
-    font-weight: 700;
-  }
-
-  .reaction-more-btn:hover {
-    color: #10b981;
-  }
-
-  .emoji-search-bar {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 8px 10px;
-    background: #090d16;
-    border-bottom: 1px solid #1f232b;
-    flex-shrink: 0;
-  }
-
-  .emoji-search-bar input {
-    flex: 1;
-    background: #0f1115;
-    border: 1px solid #1f232b;
-    border-radius: 4px;
-    padding: 6px 8px;
-    color: #e2e8f0;
-    font-size: 13px;
-    outline: none;
-  }
-
-  .emoji-search-bar input:focus {
-    border-color: #10b981;
-  }
-
-  .emoji-search-clear {
-    background: transparent;
-    border: none;
-    color: #475569;
-    cursor: pointer;
-    font-size: 12px;
-  }
-
-  .emoji-search-clear:hover {
-    color: #e2e8f0;
-  }
-
-  .emoji-react-banner {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 7px 12px;
-    background: rgba(16, 185, 129, 0.08);
-    border-bottom: 1px solid #1f232b;
-    font-size: 12px;
-    color: #94a3b8;
-    flex-shrink: 0;
-  }
-
-  .emoji-react-banner strong {
-    color: #10b981;
-  }
-
-  .emoji-react-preview {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .emoji-empty {
-    grid-column: 1 / -1;
-    text-align: center;
-    color: #475569;
-    font-size: 12px;
-    font-style: italic;
-    padding: 32px 0;
-  }
-
-  @media (pointer: coarse) {
-    .reaction-add-btn {
-      opacity: 1;
-    }
-  }
-
-  .file-card {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    background: #0f1115;
-    border: 1px solid #1f232b;
-    border-radius: 6px;
-    padding: 8px 12px;
-    max-width: 320px;
-  }
-  .file-icon { font-size: 20px; }
-
-  .file-details { display: flex; flex-direction: column; min-width: 0; flex: 1; }
-
-  .file-name {
-    color: #e2e8f0; font-size: 13px; font-weight: 600;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-
-  .file-size { color: #475569; font-size: 11px; }
-
-  .file-open-btn {
-    background: #10b981; border: none; color: #090d16;
-    padding: 4px 10px; border-radius: 4px; font-weight: 700;
-    font-size: 11px; cursor: pointer;
-  }
-
-  .file-open-btn:hover { background: #059669; }
-
-  .file-progress-label { color: #10b981; font-size: 11px; font-weight: 700; flex-shrink: 0; }
-
-  .room-list { display: flex; flex-direction: column; gap: 2px; }
-
-  .room-row {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    background: transparent;
-    border: none;
-    color: #94a3b8;
-    padding: 6px 8px;
-    border-radius: 4px;
-    cursor: pointer;
-    font-size: 13px;
-    text-align: left;
-    transition: background-color 0.15s ease, color 0.15s ease;
-  }
-
-  .room-row:hover { background: #1f232b; color: #e2e8f0; }
-  .room-row.active { background: #1f232b; color: #10b981; font-weight: 600; }
-
-  .room-row .hash-tag { font-size: 14px; }
-  .room-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-  .add-room-btn {
-    width: 100%;
-    margin-top: 6px;
-    background: transparent;
-    border: 1px dashed #1f232b;
-    color: #475569;
-    padding: 6px;
-    border-radius: 4px;
-    font-size: 11px;
-    cursor: pointer;
-    transition: border-color 0.15s ease, color 0.15s ease;
-  }
-  .add-room-btn:hover { border-color: #10b981; color: #10b981; }
-
   .room-rename-form { display: flex; gap: 6px; align-items: center; }
 
   .room-title-btn {
@@ -3123,177 +1120,6 @@ $effect(() => {
   .room-title-btn:hover .rename-hint,
   .room-title-btn:focus-visible .rename-hint {
     opacity: 1;
-  }
-
-  .reply-quote {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    background: #0f1115;
-    border: 1px solid #1f232b;
-    border-radius: 4px;
-    padding: 3px 8px;
-    max-width: 400px;
-    cursor: pointer;
-    font-size: 12px;
-    color: #475569;
-    text-align: left;
-    transition: border-color 0.15s ease, color 0.15s ease;
-  }
-
-  .reply-quote:hover { border-color: #10b981; color: #94a3b8; }
-
-  .reply-quote-ghost { cursor: default; }
-  .reply-quote-ghost:hover { border-color: #1f232b; color: #475569; }
-
-  .reply-quote-bar {
-    width: 2px;
-    align-self: stretch;
-    background: #10b981;
-    border-radius: 1px;
-    flex-shrink: 0;
-  }
-
-  .reply-quote-sender { color: #10b981; font-weight: 600; flex-shrink: 0; }
-
-  .reply-quote-text {
-    min-width: 0;
-    flex: 1 1 auto;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .reply-composer-bar {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    background: #0f1115;
-    border: 1px solid #1f232b;
-    border-left: 2px solid #10b981;
-    border-radius: 4px;
-    padding: 6px 10px;
-    margin-bottom: 8px;
-  }
-
-  .reply-composer-info {
-    display: flex;
-    flex-direction: column;
-    min-width: 0;
-    flex: 1;
-  }
-
-  .reply-composer-label { font-size: 12px; color: #94a3b8; }
-  .reply-composer-preview {
-    font-size: 12px;
-    color: #475569;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .reply-cancel-btn {
-    background: transparent;
-    border: none;
-    color: #475569;
-    font-size: 12px;
-    cursor: pointer;
-    padding: 2px 6px;
-    border-radius: 4px;
-  }
-
-  .reply-cancel-btn:hover { color: #ef4444; background: #1f232b; }
-
-  .notif-toggle-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    width: 100%;
-    background: transparent;
-    border: none;
-    color: #94a3b8;
-    font-size: 13px;
-    cursor: pointer;
-    padding: 4px 0;
-  }
-
-  .notif-toggle-label { color: #e2e8f0; }
-
-  .notif-toggle-track {
-    width: 34px;
-    height: 18px;
-    border-radius: 9px;
-    background: #1f232b;
-    border: 1px solid #334155;
-    position: relative;
-    transition: background-color 0.15s ease, border-color 0.15s ease;
-    flex-shrink: 0;
-  }
-
-  .notif-toggle-track.on {
-    background: #10b981;
-    border-color: #10b981;
-  }
-
-  .notif-toggle-thumb {
-    position: absolute;
-    top: 1px;
-    left: 1px;
-    width: 14px;
-    height: 14px;
-    border-radius: 50%;
-    background: #e2e8f0;
-    transition: transform 0.15s ease;
-  }
-
-  .notif-toggle-track.on .notif-toggle-thumb {
-    transform: translateX(16px);
-  }
-
-  .room-row-wrap {
-    display: flex;
-    align-items: center;
-    gap: 2px;
-  }
-
-  .room-row { flex: 1; min-width: 0; }
-
-  .room-badge {
-    margin-left: auto;
-    background: #10b981;
-    color: #090d16;
-    font-size: 10px;
-    font-weight: 700;
-    border-radius: 8px;
-    padding: 1px 6px;
-    min-width: 16px;
-    text-align: center;
-    flex-shrink: 0;
-  }
-
-  .room-mute-btn {
-    background: transparent;
-    border: none;
-    font-size: 11px;
-    cursor: pointer;
-    padding: 2px 4px;
-    border-radius: 4px;
-    opacity: 0;
-    transition: opacity 0.15s ease;
-    flex-shrink: 0;
-  }
-
-  .room-row-wrap:hover .room-mute-btn { opacity: 0.6; }
-  .room-mute-btn:hover { opacity: 1 !important; background: #1f232b; }
-  .room-mute-btn.muted { opacity: 0.8; }
-
-  .avatar-img {
-    width: 52px;
-    height: 52px;
-    border-radius: 50%;
-    object-fit: cover;
-    flex-shrink: 0;
-    background: #1f232b;
   }
 
   </style>
